@@ -19,10 +19,19 @@ const NOTES_FIRST_EXTENSIONS = new Set([
   "gif",
   "svg",
   "pdf",
+]);
+
+const EXCLUDED_EXTENSIONS = new Set([
   "mp3",
   "m4a",
   "wav",
   "webm",
+  "m4b",
+  "aac",
+  "ogg",
+  "flac",
+  "aiff",
+  "caf",
   "mp4",
 ]);
 
@@ -84,6 +93,9 @@ export function isTrackableSyncPath(
     return false;
   }
   if (hasExcludedSegment(filePath)) {
+    return false;
+  }
+  if (EXCLUDED_EXTENSIONS.has(getExtension(filePath))) {
     return false;
   }
   if (syncScopeMode === "broad") {

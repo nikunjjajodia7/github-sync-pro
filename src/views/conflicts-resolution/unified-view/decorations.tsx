@@ -74,8 +74,11 @@ export const createLineDecorations = (
     const builder = new RangeSetBuilder<Decoration>();
 
     for (const range of ranges) {
-      const startLine = state.doc.lineAt(range.from);
-      const endLine = state.doc.lineAt(range.to);
+      const docLength = state.doc.length;
+      const safeFrom = Math.max(0, Math.min(range.from, docLength));
+      const safeTo = Math.max(0, Math.min(range.to, docLength));
+      const startLine = state.doc.lineAt(Math.min(safeFrom, safeTo));
+      const endLine = state.doc.lineAt(Math.max(safeFrom, safeTo));
       for (let i = 0; i <= endLine.number - startLine.number; i += 1) {
         const line = state.doc.line(startLine.number + i);
         if (range.source === "remote") {
@@ -105,6 +108,19 @@ export const createResolutionDecorations = (
   rangesStateField: StateField<ConflictRange[]>,
   getView: () => EditorView,
 ) => {
+  const clampChanges = (
+    state: EditorState,
+    from: number,
+    to: number,
+  ): { from: number; to: number } => {
+    const max = state.doc.length;
+    const safeFrom = Math.max(0, Math.min(from, max));
+    const safeTo = Math.max(0, Math.min(to, max));
+    return safeFrom <= safeTo
+      ? { from: safeFrom, to: safeTo }
+      : { from: safeTo, to: safeFrom };
+  };
+
   return EditorView.decorations.compute(
     [rangesStateField],
     (state: EditorState) => {
@@ -124,12 +140,9 @@ export const createResolutionDecorations = (
             const deco = Decoration.widget({
               widget: new ResolutionWidget({
                 onAcceptAbove: () => {
+                  const changes = clampChanges(state, range.to, nextRange.to);
                   getView().dispatch({
-                    changes: {
-                      from: range.to,
-                      to: nextRange.to,
-                      insert: "",
-                    },
+                    changes: { ...changes, insert: "" },
                     effects: [
                       UpdateRangesEffect.of({
                         index,
@@ -142,12 +155,13 @@ export const createResolutionDecorations = (
                   });
                 },
                 onAcceptBelow: () => {
+                  const changes = clampChanges(
+                    state,
+                    range.from,
+                    nextRange?.from || range.to,
+                  );
                   getView().dispatch({
-                    changes: {
-                      from: range.from,
-                      to: nextRange?.from || range.to,
-                      insert: "",
-                    },
+                    changes: { ...changes, insert: "" },
                     effects: [
                       UpdateRangesEffect.of({
                         index,
@@ -174,12 +188,13 @@ export const createResolutionDecorations = (
                   });
                 },
                 onDiscardBoth: () => {
+                  const changes = clampChanges(
+                    state,
+                    Math.max(range.from - 1, 0),
+                    ranges.at(index + 2)?.from || nextRange.to,
+                  );
                   getView().dispatch({
-                    changes: {
-                      from: Math.max(range.from - 1, 0),
-                      to: ranges.at(index + 2)?.from || nextRange.to,
-                      insert: "",
-                    },
+                    changes: { ...changes, insert: "" },
                     effects: [
                       UpdateRangesEffect.of({
                         index,
@@ -207,12 +222,13 @@ export const createResolutionDecorations = (
                   });
                 },
                 onDiscard: () => {
+                  const changes = clampChanges(
+                    state,
+                    Math.max(range.from - 1, 0),
+                    nextRange?.from || range.to,
+                  );
                   getView().dispatch({
-                    changes: {
-                      from: Math.max(range.from - 1, 0),
-                      to: nextRange?.from || range.to,
-                      insert: "",
-                    },
+                    changes: { ...changes, insert: "" },
                     effects: UpdateRangesEffect.of({
                       index: index,
                     }),
@@ -241,12 +257,13 @@ export const createResolutionDecorations = (
                 });
               },
               onDiscard: () => {
+                const changes = clampChanges(
+                  state,
+                  Math.max(range.from - 1, 0),
+                  nextRange?.from || range.to,
+                );
                 getView().dispatch({
-                  changes: {
-                    from: Math.max(range.from - 1, 0),
-                    to: nextRange?.from || range.to,
-                    insert: "",
-                  },
+                  changes: { ...changes, insert: "" },
                   effects: UpdateRangesEffect.of({
                     index: index,
                   }),

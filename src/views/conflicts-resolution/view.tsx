@@ -1,9 +1,8 @@
-import { IconName, ItemView, Menu, Platform, WorkspaceLeaf } from "obsidian";
+import { IconName, ItemView, WorkspaceLeaf } from "obsidian";
 import { Root, createRoot } from "react-dom/client";
 import GitHubSyncPlugin from "src/main";
 import { ConflictFile, ConflictResolution } from "src/sync-manager";
-import SplitView from "./split-view/split-view";
-import UnifiedView from "./unified-view/unified-view";
+import SimpleConflictResolutionView from "./simple-view";
 
 export const CONFLICTS_RESOLUTION_VIEW_TYPE = "conflicts-resolution-view";
 
@@ -32,6 +31,9 @@ export class ConflictsResolutionView extends ItemView {
       this.plugin.conflictsResolver(resolutions);
       this.plugin.conflictsResolver = null;
     }
+    // Close the transient conflict view once choices are applied.
+    // This avoids showing an empty/blank pane while sync continues in background.
+    this.leaf.detach();
   }
 
   setConflictFiles(conflicts: ConflictFile[]) {
@@ -55,34 +57,12 @@ export class ConflictsResolutionView extends ItemView {
       this.root = createRoot(container);
     }
 
-    let diffMode = "default";
-    if (this.plugin.settings.conflictViewMode === "default") {
-      if (Platform.isMobile) {
-        diffMode = "unified";
-      } else {
-        diffMode = "split";
-      }
-    } else if (this.plugin.settings.conflictViewMode === "split") {
-      diffMode = "split";
-    } else if (this.plugin.settings.conflictViewMode === "unified") {
-      diffMode = "unified";
-    }
-
-    if (diffMode === "split") {
-      this.root.render(
-        <SplitView
-          initialFiles={conflicts}
-          onResolveAllConflicts={this.resolveAllConflicts.bind(this)}
-        />,
-      );
-    } else {
-      this.root.render(
-        <UnifiedView
-          initialFiles={conflicts}
-          onResolveAllConflicts={this.resolveAllConflicts.bind(this)}
-        />,
-      );
-    }
+    this.root.render(
+      <SimpleConflictResolutionView
+        initialFiles={conflicts}
+        onResolveAllConflicts={this.resolveAllConflicts.bind(this)}
+      />,
+    );
   }
 
   async onClose() {

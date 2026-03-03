@@ -28,6 +28,18 @@ interface SyncAction {
   filePath: string;
 }
 
+interface ActionExecutionResult {
+  filePath: string;
+  type: SyncAction["type"];
+  ok: boolean;
+  error?: string;
+}
+
+interface SyncRunSummary {
+  succeeded: ActionExecutionResult[];
+  failed: ActionExecutionResult[];
+}
+
 export interface ConflictFile {
   filePath: string;
   remoteContent: string;
@@ -36,12 +48,20 @@ export interface ConflictFile {
 
 export interface ConflictResolution {
   filePath: string;
-  content: string;
+  strategy?: "local" | "remote";
+  content?: string;
 }
 
 type OnConflictsCallback = (
   conflicts: ConflictFile[],
 ) => Promise<ConflictResolution[]>;
+
+class BranchHeadAdvancedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BranchHeadAdvancedError";
+  }
+}
 
 export default class SyncManager {
   private metadataStore: MetadataStore;
@@ -427,19 +447,51 @@ export default class SyncManager {
     const notice = new Notice("Syncing...");
     this.syncing = true;
     try {
-      await this.syncImpl();
-      // Shown only if sync doesn't fail
-      new Notice("Sync successful", 5000);
+      const maxAttempts = 2;
+      let attempt = 1;
+      let summary: SyncRunSummary = { succeeded: [], failed: [] };
+      while (attempt <= maxAttempts) {
+        try {
+          summary = await this.syncImpl();
+          break;
+        } catch (err) {
+          const isRetryableRace = err instanceof BranchHeadAdvancedError;
+          if (!isRetryableRace || attempt >= maxAttempts) {
+            throw err;
+          }
+          await this.logger.warn(
+            "Sync replaying after remote branch advanced",
+            { attempt, maxAttempts },
+          );
+          attempt++;
+        }
+      }
+      if (summary.failed.length > 0) {
+        await this.logger.warn("Sync partial", {
+          successCount: summary.succeeded.length,
+          failureCount: summary.failed.length,
+          failed: summary.failed,
+        });
+        new Notice(
+          `Sync partial: ${summary.succeeded.length} succeeded, ${summary.failed.length} failed (will retry)`,
+          7000,
+        );
+      } else {
+        // Shown only if sync doesn't fail
+        new Notice("Sync successful", 5000);
+      }
     } catch (err) {
       // Show the error to the user, it's not automatically dismissed to make sure
       // the user sees it.
       new Notice(`Error syncing. ${err}`);
+    } finally {
+      this.syncing = false;
+      notice.hide();
     }
-    this.syncing = false;
-    notice.hide();
   }
 
-  private async syncImpl() {
+  private async syncImpl(): Promise<SyncRunSummary> {
+    const summary: SyncRunSummary = { succeeded: [], failed: [] };
     await this.logger.info("Starting sync");
     const { files, sha: treeSha } = await this.client.getRepoContent({
       retry: true,
@@ -536,12 +588,16 @@ export default class SyncManager {
     if (conflicts.length > 0) {
       await this.logger.warn("Found conflicts", conflicts);
       if (this.settings.conflictHandling === "ask") {
-        // Here we block the sync process until the user has resolved all the conflicts
+        // Here we block the sync process until the user has resolved all conflicts.
+        // Conflict choices map directly to sync actions:
+        // - local => upload local version
+        // - remote => download remote version
         conflictResolutions = await this.onConflicts(conflicts);
         conflictActions = conflictResolutions.map(
-          (resolution: ConflictResolution) => {
-            return { type: "upload", filePath: resolution.filePath };
-          },
+          (resolution: ConflictResolution) => ({
+            type: resolution.strategy === "remote" ? "download" : "upload",
+            filePath: resolution.filePath,
+          }),
         );
       } else if (this.settings.conflictHandling === "overwriteLocal") {
         // The user explicitly wants to always overwrite the local file
@@ -610,16 +666,22 @@ export default class SyncManager {
           "No file actions to sync, committing metadata updates only",
         );
         await this.commitSync(newTreeFiles, treeSha);
-        return;
+        return summary;
       }
       // Nothing to sync
       await this.logger.info("Nothing to sync");
-      return;
+      return summary;
     }
     await this.logger.info("Actions to sync", actions);
 
-    await Promise.all(
-      actions.map(async (action) => {
+    const preparedRemoteActions: SyncAction[] = [];
+    const preparedConflictResolutions: ConflictResolution[] = [];
+
+    for (const action of actions) {
+      if (action.type !== "upload" && action.type !== "delete_remote") {
+        continue;
+      }
+      try {
         switch (action.type) {
           case "upload": {
             const normalizedPath = normalizePath(action.filePath);
@@ -643,40 +705,137 @@ export default class SyncManager {
               type: "blob",
               content: content,
             };
+            preparedRemoteActions.push(action);
+            if (resolution) {
+              preparedConflictResolutions.push(resolution);
+            }
             break;
           }
           case "delete_remote": {
+            if (!newTreeFiles[action.filePath]) {
+              throw new Error("Missing remote tree item for delete_remote");
+            }
             newTreeFiles[action.filePath].sha = null;
+            preparedRemoteActions.push(action);
             break;
           }
-          case "download":
-            break;
-          case "delete_local":
-            break;
         }
-      }),
-    );
+      } catch (err) {
+        summary.failed.push({
+          filePath: action.filePath,
+          type: action.type,
+          ok: false,
+          error: `${err}`,
+        });
+        await this.logger.warn("Action failed", {
+          filePath: action.filePath,
+          type: action.type,
+          error: `${err}`,
+        });
+        if (!this.metadataStore.data.files[action.filePath]) {
+          this.metadataStore.data.files[action.filePath] = {
+            path: action.filePath,
+            sha: null,
+            dirty: true,
+            justDownloaded: false,
+            lastModified: Date.now(),
+          };
+        } else {
+          this.metadataStore.data.files[action.filePath].dirty = true;
+          this.metadataStore.data.files[action.filePath].lastModified =
+            Date.now();
+        }
+      }
+    }
 
     // Download files and delete local files
-    await Promise.all([
-      ...actions
-        .filter((action) => action.type === "download")
-        .map(async (action: SyncAction) => {
-          await this.downloadFile(
-            files[action.filePath],
-            remoteMetadata.files[action.filePath]
-              ? remoteMetadata.files[action.filePath].lastModified
-              : Date.now(),
-          );
-        }),
-      ...actions
-        .filter((action) => action.type === "delete_local")
-        .map(async (action: SyncAction) => {
-          await this.deleteLocalFile(action.filePath);
-        }),
-    ]);
+    for (const action of actions.filter((item) => item.type === "download")) {
+      try {
+        await this.downloadFile(
+          files[action.filePath],
+          remoteMetadata.files[action.filePath]
+            ? remoteMetadata.files[action.filePath].lastModified
+            : Date.now(),
+        );
+        summary.succeeded.push({
+          filePath: action.filePath,
+          type: action.type,
+          ok: true,
+        });
+      } catch (err) {
+        summary.failed.push({
+          filePath: action.filePath,
+          type: action.type,
+          ok: false,
+          error: `${err}`,
+        });
+        await this.logger.warn("Action failed", {
+          filePath: action.filePath,
+          type: action.type,
+          error: `${err}`,
+        });
+      }
+    }
 
-    await this.commitSync(newTreeFiles, treeSha, conflictResolutions);
+    for (const action of actions.filter((item) => item.type === "delete_local")) {
+      try {
+        await this.deleteLocalFile(action.filePath);
+        summary.succeeded.push({
+          filePath: action.filePath,
+          type: action.type,
+          ok: true,
+        });
+      } catch (err) {
+        summary.failed.push({
+          filePath: action.filePath,
+          type: action.type,
+          ok: false,
+          error: `${err}`,
+        });
+        await this.logger.warn("Action failed", {
+          filePath: action.filePath,
+          type: action.type,
+          error: `${err}`,
+        });
+      }
+    }
+
+    if (preparedRemoteActions.length > 0) {
+      try {
+        await this.commitSync(
+          newTreeFiles,
+          treeSha,
+          preparedConflictResolutions,
+        );
+        summary.succeeded.push(
+          ...preparedRemoteActions.map((action) => ({
+            filePath: action.filePath,
+            type: action.type,
+            ok: true,
+          })),
+        );
+      } catch (err) {
+        if (err instanceof BranchHeadAdvancedError) {
+          throw err;
+        }
+        summary.failed.push(
+          ...preparedRemoteActions.map((action) => ({
+            filePath: action.filePath,
+            type: action.type,
+            ok: false,
+            error: `${err}`,
+          })),
+        );
+        await this.logger.error("Remote commit failed for prepared actions", {
+          error: `${err}`,
+          preparedRemoteActions,
+        });
+      }
+    } else if (metadataChanged) {
+      await this.commitSync(newTreeFiles, treeSha);
+    }
+
+    return summary;
   }
 
   /**
@@ -805,22 +964,6 @@ export default class SyncManager {
     const conflictPaths = conflicts.filter(
       (filePath): filePath is string => filePath !== null,
     );
-    const binaryConflictPaths = conflictPaths.filter(
-      (filePath) => !hasTextExtension(filePath),
-    );
-    if (
-      this.settings.conflictHandling === "ask" &&
-      binaryConflictPaths.length > 0
-    ) {
-      await this.logger.error(
-        "Binary conflicts are not supported in Ask mode. Use overwriteLocal or overwriteRemote.",
-        binaryConflictPaths,
-      );
-      throw new Error(
-        "Binary conflict detected. Set conflict handling to Overwrite local or Overwrite remote and sync again.",
-      );
-    }
-
     return await Promise.all(
       conflictPaths.map(async (filePath: string) => {
         if (!hasTextExtension(filePath)) {
@@ -1012,7 +1155,9 @@ export default class SyncManager {
     const contentBuffer = await this.vault.adapter.readBinary(filePath);
     const contentBytes = new Uint8Array(contentBuffer);
     const header = new TextEncoder().encode(`blob ${contentBytes.length}\0`);
-    const store = new Uint8Array([...header, ...contentBytes]);
+    const store = new Uint8Array(header.length + contentBytes.length);
+    store.set(header, 0);
+    store.set(contentBytes, header.length);
     return await crypto.subtle.digest("SHA-1", store).then((hash) =>
       Array.from(new Uint8Array(hash))
         .map((b) => b.toString(16).padStart(2, "0"))
@@ -1028,7 +1173,9 @@ export default class SyncManager {
   async calculateTextSHA(content: string): Promise<string> {
     const contentBytes = new TextEncoder().encode(content);
     const header = new TextEncoder().encode(`blob ${contentBytes.length}\0`);
-    const store = new Uint8Array([...header, ...contentBytes]);
+    const store = new Uint8Array(header.length + contentBytes.length);
+    store.set(header, 0);
+    store.set(contentBytes, header.length);
     return await crypto.subtle.digest("SHA-1", store).then((hash) =>
       Array.from(new Uint8Array(hash))
         .map((b) => b.toString(16).padStart(2, "0"))
@@ -1048,10 +1195,15 @@ export default class SyncManager {
     baseTreeSha: string,
     conflictResolutions: ConflictResolution[] = [],
   ) {
+    const contentResolutions = conflictResolutions.filter(
+      (resolution): resolution is ConflictResolution & { content: string } =>
+        typeof resolution.content === "string",
+    );
+
     // Update local sync time
     const syncTime = Date.now();
     this.metadataStore.data.lastSync = syncTime;
-    this.metadataStore.save();
+    await this.metadataStore.save();
 
     // We update the last modified timestamp for all files that had resolved conflicts
     // to the the same time as the sync time.
@@ -1061,7 +1213,7 @@ export default class SyncManager {
     // on the remote metadata we update the timestamp for the conflicting files here,
     // just before pushing to remote.
     // We're going to update the local content when the sync is successful.
-    conflictResolutions.forEach((resolution) => {
+    contentResolutions.forEach((resolution) => {
       this.metadataStore.data.files[resolution.filePath].lastModified =
         syncTime;
     });
@@ -1138,11 +1290,20 @@ export default class SyncManager {
       parent: branchHeadSha,
     });
 
-    await this.client.updateBranchHead({ sha: commitSha, retry: true });
+    try {
+      await this.client.updateBranchHead({ sha: commitSha, retry: true });
+    } catch (err) {
+      if (err?.status === 422) {
+        throw new BranchHeadAdvancedError(
+          "Remote branch advanced while syncing",
+        );
+      }
+      throw err;
+    }
 
     // Update the local content of all files that had conflicts we resolved
     await Promise.all(
-      conflictResolutions.map(async (resolution) => {
+      contentResolutions.map(async (resolution) => {
         await this.vault.adapter.write(resolution.filePath, resolution.content);
         // Even though we set the last modified timestamp for all files with conflicts
         // just before pushing the changes to remote we do it here again because the
@@ -1155,7 +1316,7 @@ export default class SyncManager {
     );
     // Now that the sync is done and we updated the content for conflicting files
     // we can save the latest metadata to disk.
-    this.metadataStore.save();
+    await this.metadataStore.save();
     await this.logger.info("Sync done");
   }
 
@@ -1189,10 +1350,21 @@ export default class SyncManager {
 
   async deleteLocalFile(filePath: string) {
     const normalizedPath = normalizePath(filePath);
-    await this.vault.adapter.remove(normalizedPath);
+    if (await this.vault.adapter.exists(normalizedPath)) {
+      await this.vault.adapter.remove(normalizedPath);
+    }
+    if (!this.metadataStore.data.files[filePath]) {
+      this.metadataStore.data.files[filePath] = {
+        path: filePath,
+        sha: null,
+        dirty: false,
+        justDownloaded: false,
+        lastModified: Date.now(),
+      };
+    }
     this.metadataStore.data.files[filePath].deleted = true;
     this.metadataStore.data.files[filePath].deletedAt = Date.now();
-    this.metadataStore.save();
+    await this.metadataStore.save();
   }
 
   async loadMetadata() {
@@ -1251,7 +1423,7 @@ export default class SyncManager {
         justDownloaded: false,
         lastModified: Date.now(),
       };
-      this.metadataStore.save();
+      await this.metadataStore.save();
     }
     await this.logger.info("Loaded metadata");
   }
@@ -1288,7 +1460,7 @@ export default class SyncManager {
         lastModified: Date.now(),
       };
     });
-    this.metadataStore.save();
+    await this.metadataStore.save();
   }
 
   /**
@@ -1321,7 +1493,7 @@ export default class SyncManager {
       }
       delete this.metadataStore.data.files[filePath];
     });
-    this.metadataStore.save();
+    await this.metadataStore.save();
   }
 
   getFileMetadata(filePath: string): FileMetadata {

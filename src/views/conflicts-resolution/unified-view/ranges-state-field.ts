@@ -37,6 +37,9 @@ export const createRangesStateField = (
         return ranges;
       }
 
+      const docLength = tr.newDoc.length;
+      const clampPos = (pos: number) => Math.max(0, Math.min(pos, docLength));
+
       // Map all positions through the changes and apply any effect
       let newRanges = ranges
         .map((range, index) => {
@@ -45,9 +48,11 @@ export const createRangesStateField = (
           if (effect) {
             source = effect.newSource;
           }
+          const from = clampPos(tr.changes.mapPos(range.from));
+          const to = clampPos(tr.changes.mapPos(range.to, 1));
           return {
-            from: tr.changes.mapPos(range.from),
-            to: tr.changes.mapPos(range.to, 1),
+            from: Math.min(from, to),
+            to: Math.max(from, to),
             source,
           };
         })

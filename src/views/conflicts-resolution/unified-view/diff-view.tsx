@@ -8,6 +8,7 @@ import {
   createLineDecorations,
   createResolutionDecorations,
 } from "./decorations";
+import { UpdateRangesEffect } from "./ranges-state-field";
 
 interface DiffViewProps {
   initialRemoteText: string;
@@ -138,15 +139,15 @@ const DiffView: React.FC<DiffViewProps> = ({
         () => editorViewRef.current!,
       ),
       EditorView.updateListener.of((update) => {
-        if (update.docChanged) {
+        const hasRangeEffects = update.transactions.some((tx) =>
+          tx.effects.some((effect) => effect.is(UpdateRangesEffect)),
+        );
+        if (update.docChanged || hasRangeEffects) {
           const conflictRanges = update.state.field(conflictRangesField);
-          const allConflictsSolved = conflictRanges.some(
+          const hasUnresolvedConflicts = conflictRanges.some(
             (range) => range.source === "remote" || range.source === "local",
           );
-
-          if (!allConflictsSolved) {
-            setHasConflicts(allConflictsSolved);
-          }
+          setHasConflicts(hasUnresolvedConflicts);
         }
       }),
       EditorView.editable.of(true),
