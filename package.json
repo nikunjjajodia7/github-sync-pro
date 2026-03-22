@@ -7,7 +7,8 @@
     "dev": "node esbuild.config.mjs",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
     "version": "node version-bump.mjs",
-    "benchmark": "tsx benchmark.ts"
+    "benchmark": "tsx benchmark.ts",
+    "test": "vitest run"
   },
   "keywords": [],
   "author": "nikunjjajodia7",
@@ -27,7 +28,8 @@
     "sinon": "^20.0.0",
     "tslib": "^2.8.1",
     "tsx": "^4.19.3",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.0"
   },
   "dependencies": {
     "@codemirror/lang-markdown": "^6.3.2",

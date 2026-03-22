@@ -7,14 +7,39 @@ import { isTrackableSyncPath } from "./sync-scope";
 
 /**
  * Tracks changes to local sync directory and updates files metadata.
+ * Uses debounced saves to avoid excessive disk writes during rapid edits.
  */
 export default class EventsListener {
+  private saveTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly SAVE_DEBOUNCE_MS = 500;
+
+  // Callback invoked when dirty files are detected after debounce.
+  // Used by SyncManager to trigger push-on-save.
+  onDirtyFiles: (() => void) | null = null;
+
   constructor(
     private vault: Vault,
     private metadataStore: MetadataStore,
     private settings: GitHubSyncSettings,
     private logger: Logger,
   ) {}
+
+  /**
+   * Schedule a debounced metadata save. Multiple rapid events
+   * (e.g., keystrokes) will coalesce into a single disk write.
+   */
+  private scheduleSave(hasDirtyChanges: boolean = false) {
+    if (this.saveTimer !== null) {
+      clearTimeout(this.saveTimer);
+    }
+    this.saveTimer = setTimeout(async () => {
+      this.saveTimer = null;
+      await this.metadataStore.save();
+      if (hasDirtyChanges && this.onDirtyFiles) {
+        this.onDirtyFiles();
+      }
+    }, EventsListener.SAVE_DEBOUNCE_MS);
+  }
 
   start(plugin: GitHubSyncPlugin) {
     // We need to register all the events we subscribe to so they can
@@ -43,7 +68,7 @@ export default class EventsListener {
       // This file was just downloaded and not created by the user.
       // It's enough to mark it as non just downloaded.
       this.metadataStore.data.files[file.path].justDownloaded = false;
-      await this.metadataStore.save();
+      this.scheduleSave();
       await this.logger.info("Updated just downloaded created file", file.path);
       return;
     }
@@ -56,7 +81,7 @@ export default class EventsListener {
       justDownloaded: false,
       lastModified: Date.now(),
     };
-    await this.metadataStore.save();
+    this.scheduleSave(true);
     await this.logger.info("Updated created file", file.path);
   }
 
@@ -78,7 +103,7 @@ export default class EventsListener {
     }
     this.metadataStore.data.files[filePath].deleted = true;
     this.metadataStore.data.files[filePath].deletedAt = Date.now();
-    await this.metadataStore.save();
+    this.scheduleSave(true);
     await this.logger.info("Updated deleted file", filePath);
   }
 
@@ -96,9 +121,9 @@ export default class EventsListener {
     const data = this.metadataStore.data.files[file.path];
     if (data && data.justDownloaded) {
       // This file was just downloaded and not modified by the user.
-      // It's enough to makr it as non just downloaded.
+      // It's enough to mark it as non just downloaded.
       this.metadataStore.data.files[file.path].justDownloaded = false;
-      await this.metadataStore.save();
+      this.scheduleSave();
       await this.logger.info(
         "Updated just downloaded modified file",
         file.path,
@@ -116,7 +141,7 @@ export default class EventsListener {
     }
     this.metadataStore.data.files[file.path].lastModified = Date.now();
     this.metadataStore.data.files[file.path].dirty = true;
-    await this.metadataStore.save();
+    this.scheduleSave(true);
     await this.logger.info("Updated modified file", file.path);
   }
 

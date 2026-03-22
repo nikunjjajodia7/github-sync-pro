@@ -68,6 +68,9 @@ export default class SyncManager {
   private client: GithubClient;
   private eventsListener: EventsListener;
   private syncIntervalId: number | null = null;
+  private pushOnSaveTimer: ReturnType<typeof setTimeout> | null = null;
+
+  private static readonly PUSH_ON_SAVE_DEBOUNCE_MS = 2000;
 
   // Use to track if syncing is in progress, this ideally
   // prevents multiple syncs at the same time and creation
@@ -88,6 +91,26 @@ export default class SyncManager {
       this.settings,
       this.logger,
     );
+
+    // Wire up push-on-save: when EventsListener detects dirty files,
+    // schedule a sync after a 2s debounce (only in interval mode).
+    this.eventsListener.onDirtyFiles = () => {
+      if (this.settings.syncStrategy !== "interval") return;
+      if (this.pushOnSaveTimer !== null) {
+        clearTimeout(this.pushOnSaveTimer);
+      }
+      this.pushOnSaveTimer = setTimeout(async () => {
+        this.pushOnSaveTimer = null;
+        await this.sync();
+      }, SyncManager.PUSH_ON_SAVE_DEBOUNCE_MS);
+    };
+  }
+
+  /**
+   * Returns the current GitHub API rate limit info.
+   */
+  getRateLimit() {
+    return this.client.rateLimit;
   }
 
   private isTrackablePath(filePath: string, includeManifest: boolean = false): boolean {
@@ -134,11 +157,9 @@ export default class SyncManager {
     this.syncing = true;
     try {
       await this.firstSyncImpl();
-    } catch (err) {
+    } finally {
       this.syncing = false;
-      throw err;
     }
-    this.syncing = false;
   }
 
   private async firstSyncImpl() {
@@ -159,7 +180,6 @@ export default class SyncManager {
       // 404 instead is returned in case there are no files.
       // Either way we can handle both by commiting a new empty manifest.
       if (err.status !== 409 && err.status !== 404) {
-        this.syncing = false;
         throw err;
       }
       // The repository is bare, meaning it has no tree, no commits and no branches
