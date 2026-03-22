@@ -169,6 +169,36 @@ export default class GitHubSyncSettingsTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
+      .setName("Exclude patterns")
+      .setDesc(
+        "Files matching these patterns will not be synced. One pattern per line. " +
+        "Use ! prefix (e.g., !attachments/** to exclude all attachments). " +
+        "Lines without ! are ignored.",
+      )
+      .addTextArea((text) => {
+        text
+          .setPlaceholder("!attachments/**\n!*.pdf\n!private/**")
+          .setValue((this.plugin.settings.excludePatterns || []).join("\n"))
+          .onChange(async (value) => {
+            const patterns = value
+              .split("\n")
+              .map((l) => l.trim())
+              .filter((l) => l.length > 0);
+            // Warn on dangerous patterns
+            if (patterns.some((p) => p === "!**/*" || p === "!**")) {
+              new Notice(
+                "Warning: this pattern would exclude ALL files from syncing!",
+                8000,
+              );
+            }
+            this.plugin.settings.excludePatterns = patterns;
+            await this.plugin.saveSettings();
+          });
+        text.inputEl.rows = 4;
+        text.inputEl.cols = 30;
+      });
+
+    new Setting(containerEl)
       .setName("Sync configs")
       .setDesc("Sync Vault config folder with remote repository")
       .addToggle((toggle) => {

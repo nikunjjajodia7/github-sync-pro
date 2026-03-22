@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll } from "vitest";
-import { isTrackableSyncPath } from "../sync-scope";
+import { isTrackableSyncPath, matchesExcludePattern } from "../sync-scope";
 
 // Obsidian monkey-patches Array and String prototypes with .contains and .last
 // We need to polyfill these for the test environment.
@@ -39,6 +39,7 @@ const defaultOpts = {
   syncConfigDir: false,
   syncScopeMode: "notes-first" as "notes-first" | "broad",
   includeManifest: true,
+  excludePatterns: [] as string[],
 };
 
 function opts(overrides: Partial<typeof defaultOpts> = {}) {
@@ -115,5 +116,45 @@ describe("isTrackableSyncPath", () => {
     expect(isTrackableSyncPath("data/file.docx", opts({ syncScopeMode: "notes-first" }))).toBe(
       false,
     );
+  });
+
+  it("should exclude files matching user exclude patterns", () => {
+    const patterns = ["!attachments/**", "!**/*.pdf"];
+    expect(isTrackableSyncPath("attachments/image.png", opts({ excludePatterns: patterns }))).toBe(false);
+    expect(isTrackableSyncPath("attachments/sub/deep.png", opts({ excludePatterns: patterns }))).toBe(false);
+    expect(isTrackableSyncPath("notes/doc.pdf", opts({ excludePatterns: patterns }))).toBe(false);
+    expect(isTrackableSyncPath("doc.pdf", opts({ excludePatterns: ["!*.pdf"] }))).toBe(false);
+  });
+
+  it("should NOT exclude files that don't match user patterns", () => {
+    const patterns = ["!attachments/**"];
+    expect(isTrackableSyncPath("notes/hello.md", opts({ excludePatterns: patterns }))).toBe(true);
+  });
+
+  it("should ignore bare lines (without ! prefix) in exclude patterns", () => {
+    const patterns = ["attachments/**", "# comment"];
+    expect(isTrackableSyncPath("attachments/image.png", opts({ excludePatterns: patterns }))).toBe(true);
+  });
+});
+
+describe("matchesExcludePattern", () => {
+  it("matches glob with **", () => {
+    expect(matchesExcludePattern("attachments/img.png", "!attachments/**")).toBe(true);
+    expect(matchesExcludePattern("attachments/sub/img.png", "!attachments/**")).toBe(true);
+  });
+
+  it("matches glob with *", () => {
+    expect(matchesExcludePattern("notes/file.pdf", "!notes/*.pdf")).toBe(true);
+    expect(matchesExcludePattern("notes/sub/file.pdf", "!notes/*.pdf")).toBe(false);
+  });
+
+  it("returns false for bare lines without !", () => {
+    expect(matchesExcludePattern("anything.md", "anything.md")).toBe(false);
+    expect(matchesExcludePattern("anything.md", "# comment")).toBe(false);
+  });
+
+  it("matches exact file paths", () => {
+    expect(matchesExcludePattern("private/secret.md", "!private/secret.md")).toBe(true);
+    expect(matchesExcludePattern("other/file.md", "!private/secret.md")).toBe(false);
   });
 });

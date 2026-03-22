@@ -120,6 +120,7 @@ export default class SyncManager {
       logPath: `${this.vault.configDir}/${LOG_FILE_NAME}`,
       syncConfigDir: this.settings.syncConfigDir,
       syncScopeMode: this.settings.syncScopeMode,
+      excludePatterns: this.settings.excludePatterns || [],
       includeManifest,
     });
   }

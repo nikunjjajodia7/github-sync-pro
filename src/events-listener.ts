@@ -181,6 +181,7 @@ export default class EventsListener {
       logPath: `${this.vault.configDir}/${LOG_FILE_NAME}`,
       syncConfigDir: this.settings.syncConfigDir,
       syncScopeMode: this.settings.syncScopeMode,
+      excludePatterns: this.settings.excludePatterns || [],
       includeManifest: true,
     });
   }
