@@ -13,6 +13,10 @@ import {
   ConflictsResolutionView,
   CONFLICTS_RESOLUTION_VIEW_TYPE,
 } from "./views/conflicts-resolution/view";
+import {
+  VersionHistoryItemView,
+  VERSION_HISTORY_VIEW_TYPE,
+} from "./views/version-history/view";
 import { OnboardingWizardModal } from "./onboarding-wizard";
 import { refreshAccessToken, validateToken } from "./oauth";
 
@@ -135,6 +139,11 @@ export default class GitHubSyncPlugin extends Plugin {
       (leaf) => new ConflictsResolutionView(leaf, this, this.conflicts),
     );
 
+    this.registerView(
+      VERSION_HISTORY_VIEW_TYPE,
+      (leaf) => new VersionHistoryItemView(leaf, this, ""),
+    );
+
     this.addSettingTab(new GitHubSyncSettingsTab(this.app, this));
 
     this.syncManager = new SyncManager(
@@ -205,6 +214,54 @@ export default class GitHubSyncPlugin extends Plugin {
       icon: "settings",
       callback: () => new OnboardingWizardModal(this).open(),
     });
+
+    this.addCommand({
+      id: "view-file-history",
+      name: "View file history",
+      repeatable: false,
+      icon: "history",
+      checkCallback: (checking: boolean) => {
+        const activeFile = this.app.workspace.getActiveFile();
+        if (!activeFile || !this.isConfigured()) return false;
+        if (checking) return true;
+        this.openVersionHistory(activeFile.path);
+      },
+    });
+
+    // Register file menu item for right-click → "View history"
+    this.registerEvent(
+      this.app.workspace.on("file-menu", (menu, file) => {
+        if (!this.isConfigured()) return;
+        if (file instanceof this.app.vault.constructor) return; // skip folders
+        menu.addItem((item) => {
+          item
+            .setTitle("View sync history")
+            .setIcon("history")
+            .onClick(() => this.openVersionHistory(file.path));
+        });
+      }),
+    );
+  }
+
+  async openVersionHistory(filePath: string) {
+    const { workspace } = this.app;
+    // Check if view already open
+    const existing = workspace.getLeavesOfType(VERSION_HISTORY_VIEW_TYPE);
+    if (existing.length > 0) {
+      const view = existing[0].view as VersionHistoryItemView;
+      view.setFilePath(filePath);
+      workspace.revealLeaf(existing[0]);
+      return;
+    }
+    // Open in a new leaf to the right
+    const leaf = workspace.getLeaf("split", "vertical");
+    await leaf.setViewState({
+      type: VERSION_HISTORY_VIEW_TYPE,
+      active: true,
+    });
+    const view = leaf.view as VersionHistoryItemView;
+    view.setFilePath(filePath);
+    workspace.revealLeaf(leaf);
   }
 
   async sync() {

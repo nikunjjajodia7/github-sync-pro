@@ -48,6 +48,16 @@ export type BlobFile = {
 };
 
 /**
+ * Represents a commit that modified a specific file.
+ */
+export type FileCommit = {
+  sha: string;
+  message: string;
+  date: string;
+  authorName: string;
+};
+
+/**
  * Custom error to make some stuff easier
  */
 class GithubAPIError extends Error {
@@ -317,5 +327,64 @@ export default class GithubClient {
       maxRetries,
     });
     return response.arrayBuffer;
+  }
+
+  /**
+   * Get the commit history for a specific file path.
+   */
+  async getFileCommits({
+    path,
+    perPage = 30,
+    retry = false,
+    maxRetries = 3,
+  }: {
+    path: string;
+    perPage?: number;
+    retry?: boolean;
+    maxRetries?: number;
+  }): Promise<FileCommit[]> {
+    const response = await this.request({
+      url: this.repoUrl(`/commits?path=${encodeURIComponent(path)}&sha=${this.settings.githubBranch}&per_page=${perPage}`),
+      errorMessage: "Failed to get file commits",
+      retry,
+      maxRetries,
+    });
+    return response.json.map((commit: any) => ({
+      sha: commit.sha,
+      message: commit.commit.message,
+      date: commit.commit.committer.date,
+      authorName: commit.commit.author.name,
+    }));
+  }
+
+  /**
+   * Get file content at a specific commit SHA.
+   */
+  async getFileAtCommit({
+    path,
+    commitSha,
+    retry = false,
+    maxRetries = 3,
+  }: {
+    path: string;
+    commitSha: string;
+    retry?: boolean;
+    maxRetries?: number;
+  }): Promise<string | null> {
+    // Get the tree at this commit to find the file's blob SHA
+    const treeResponse = await this.request({
+      url: `https://api.github.com/repos/${this.settings.githubOwner}/${this.settings.githubRepo}/git/trees/${commitSha}?recursive=1`,
+      errorMessage: "Failed to get tree at commit",
+      retry,
+      maxRetries,
+    });
+
+    const fileEntry = treeResponse.json.tree.find(
+      (item: any) => item.path === path && item.type === "blob"
+    );
+    if (!fileEntry) return null;
+
+    const blob = await this.getBlob({ sha: fileEntry.sha, retry, maxRetries });
+    return blob.content; // base64 encoded
   }
 }

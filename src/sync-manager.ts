@@ -114,6 +114,20 @@ export default class SyncManager {
     return this.client.rateLimit;
   }
 
+  /**
+   * Returns the GitHub API client (for version history and other read operations).
+   */
+  getClient() {
+    return this.client;
+  }
+
+  /**
+   * Returns true if a sync is currently in progress.
+   */
+  isSyncing() {
+    return this.syncing;
+  }
+
   private isTrackablePath(filePath: string, includeManifest: boolean = false): boolean {
     return isTrackableSyncPath(filePath, {
       configDir: this.vault.configDir,
