@@ -22,6 +22,7 @@ import { decodeBase64String, hasTextExtension } from "./utils";
 import GitHubSyncPlugin from "./main";
 import { BlobReader, Entry, Uint8ArrayWriter, ZipReader } from "@zip.js/zip.js";
 import { isTrackableSyncPath } from "./sync-scope";
+import { tryThreeWayMerge } from "./auto-merge";
 
 interface SyncAction {
   type: "upload" | "download" | "delete_local" | "delete_remote";
@@ -606,14 +607,64 @@ export default class SyncManager {
     // commit the sync.
     let conflictResolutions: ConflictResolution[] = [];
 
-    if (conflicts.length > 0) {
-      await this.logger.warn("Found conflicts", conflicts);
+    // Attempt auto-merge for text conflicts that have a known ancestor
+    const remainingConflicts: ConflictFile[] = [];
+    for (const conflict of conflicts) {
+      if (!conflict.localContent || !conflict.remoteContent) {
+        // Binary or empty content — can't auto-merge
+        remainingConflicts.push(conflict);
+        continue;
+      }
+      const localMeta = this.metadataStore.data.files[conflict.filePath];
+      if (!localMeta?.ancestorSha) {
+        // No ancestor available — fall back to manual resolution
+        remainingConflicts.push(conflict);
+        continue;
+      }
+      try {
+        const ancestorBlob = await this.client.getBlob({
+          sha: localMeta.ancestorSha,
+          retry: true,
+          maxRetries: 1,
+        });
+        const ancestorContent = decodeBase64String(ancestorBlob.content);
+        const mergeResult = tryThreeWayMerge(
+          conflict.localContent,
+          conflict.remoteContent,
+          ancestorContent,
+        );
+        if (mergeResult.clean && mergeResult.mergedContent !== null) {
+          // Clean merge! Apply locally and mark as upload
+          await this.vault.adapter.write(
+            normalizePath(conflict.filePath),
+            mergeResult.mergedContent,
+          );
+          conflictResolutions.push({
+            filePath: conflict.filePath,
+            strategy: "local",
+            content: mergeResult.mergedContent,
+          });
+          conflictActions.push({
+            type: "upload",
+            filePath: conflict.filePath,
+          });
+          await this.logger.info("Auto-merged conflict", conflict.filePath);
+          continue;
+        }
+      } catch {
+        // Ancestor fetch failed — fall through to manual
+      }
+      remainingConflicts.push(conflict);
+    }
+
+    if (remainingConflicts.length > 0) {
+      await this.logger.warn("Found conflicts", remainingConflicts);
       if (this.settings.conflictHandling === "ask") {
         // Here we block the sync process until the user has resolved all conflicts.
         // Conflict choices map directly to sync actions:
         // - local => upload local version
         // - remote => download remote version
-        conflictResolutions = await this.onConflicts(conflicts);
+        conflictResolutions = await this.onConflicts(remainingConflicts);
         conflictActions = conflictResolutions.map(
           (resolution: ConflictResolution) => ({
             type: resolution.strategy === "remote" ? "download" : "upload",
@@ -621,23 +672,13 @@ export default class SyncManager {
           }),
         );
       } else if (this.settings.conflictHandling === "overwriteLocal") {
-        // The user explicitly wants to always overwrite the local file
-        // in case of conflicts so we just download the remote file to solve it
-
-        // It's not necessary to set conflict resolutions as the content the
-        // user expect must be the content of the remote file with no changes.
-        conflictActions = conflicts.map((conflict: ConflictFile) => {
-          return { type: "download", filePath: conflict.filePath };
-        });
+        conflictActions.push(...remainingConflicts.map((conflict: ConflictFile) => ({
+          type: "download" as const, filePath: conflict.filePath,
+        })));
       } else if (this.settings.conflictHandling === "overwriteRemote") {
-        // The user explicitly wants to always overwrite the remote file
-        // in case of conflicts so we just upload the remote file to solve it.
-
-        // It's not necessary to set conflict resolutions as the content the
-        // user expect must be the content of the local file with no changes.
-        conflictActions = conflicts.map((conflict: ConflictFile) => {
-          return { type: "upload", filePath: conflict.filePath };
-        });
+        conflictActions.push(...remainingConflicts.map((conflict: ConflictFile) => ({
+          type: "upload" as const, filePath: conflict.filePath,
+        })));
       }
     }
 
@@ -1264,6 +1305,9 @@ export default class SyncManager {
             const sha = resolution
               ? await this.calculateTextSHA(treeFiles[filePath].content!)
               : await this.calculateSHA(filePath);
+            // Store current sha as ancestor before updating
+            this.metadataStore.data.files[filePath].ancestorSha =
+              this.metadataStore.data.files[filePath].sha;
             this.metadataStore.data.files[filePath].sha = sha;
             return;
           }

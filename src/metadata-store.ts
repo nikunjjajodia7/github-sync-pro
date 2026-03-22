@@ -30,6 +30,8 @@ export interface FileMetadata {
   deleted?: boolean | null;
   // When the file was deleted
   deletedAt?: number | null;
+  // SHA of the common ancestor version (for three-way merge on conflicts)
+  ancestorSha?: string | null;
 }
 
 export interface Metadata {
