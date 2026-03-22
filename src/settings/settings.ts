@@ -4,6 +4,8 @@ export interface GitHubSyncSettings {
   githubOwner: string;
   githubRepo: string;
   githubBranch: string;
+  refreshToken: string;
+  tokenExpiresAt: number;
   syncScopeMode: "notes-first" | "broad";
   syncStrategy: "manual" | "interval";
   syncInterval: number;
@@ -23,6 +25,8 @@ export const DEFAULT_SETTINGS: GitHubSyncSettings = {
   githubOwner: "",
   githubRepo: "",
   githubBranch: "main",
+  refreshToken: "",
+  tokenExpiresAt: 0,
   syncScopeMode: "notes-first",
   syncStrategy: "manual",
   syncInterval: 1,

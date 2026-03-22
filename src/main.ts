@@ -13,6 +13,8 @@ import {
   ConflictsResolutionView,
   CONFLICTS_RESOLUTION_VIEW_TYPE,
 } from "./views/conflicts-resolution/view";
+import { OnboardingWizardModal } from "./onboarding-wizard";
+import { refreshAccessToken, validateToken } from "./oauth";
 
 export default class GitHubSyncPlugin extends Plugin {
   settings: GitHubSyncSettings;
@@ -40,14 +42,59 @@ export default class GitHubSyncPlugin extends Plugin {
   // By keeping them here we can recreate it easily.
   private conflicts: ConflictFile[] = [];
 
+  private isConfigured(): boolean {
+    return (
+      this.settings.githubToken !== "" &&
+      this.settings.githubOwner !== "" &&
+      this.settings.githubRepo !== "" &&
+      this.settings.githubBranch !== ""
+    );
+  }
+
   async onUserEnable() {
-    if (
-      this.settings.githubToken === "" ||
-      this.settings.githubOwner === "" ||
-      this.settings.githubRepo === "" ||
-      this.settings.githubBranch === ""
-    ) {
-      new Notice("Go to settings to configure syncing");
+    if (!this.isConfigured()) {
+      // Show onboarding wizard for new users
+      new OnboardingWizardModal(this).open();
+    }
+  }
+
+  /**
+   * Check if the token needs refreshing and refresh it if needed.
+   * Called on startup before any sync operations.
+   */
+  private async ensureValidToken(): Promise<boolean> {
+    if (!this.settings.githubToken) return false;
+
+    // If we have a refresh token and the access token is expired or expiring soon
+    if (this.settings.refreshToken && this.settings.tokenExpiresAt > 0) {
+      const fiveMinutesFromNow = Date.now() + 5 * 60 * 1000;
+      if (this.settings.tokenExpiresAt < fiveMinutesFromNow) {
+        try {
+          this.logger.info("Access token expired or expiring soon, refreshing...");
+          const newToken = await refreshAccessToken(this.settings.refreshToken);
+          this.settings.githubToken = newToken.access_token;
+          this.settings.refreshToken = newToken.refresh_token || this.settings.refreshToken;
+          this.settings.tokenExpiresAt = newToken.expires_in
+            ? Date.now() + newToken.expires_in * 1000
+            : 0;
+          await this.saveSettings();
+          this.logger.info("Token refreshed successfully");
+          return true;
+        } catch (err) {
+          this.logger.error("Failed to refresh token", err);
+          new Notice("GitHub token expired. Please re-authenticate in settings.");
+          return false;
+        }
+      }
+    }
+
+    // Validate the token is still good (lightweight check)
+    try {
+      await validateToken(this.settings.githubToken);
+      return true;
+    } catch {
+      new Notice("GitHub token is invalid. Please re-authenticate in settings.");
+      return false;
     }
   }
 
@@ -150,18 +197,25 @@ export default class GitHubSyncPlugin extends Plugin {
       icon: "refresh-cw",
       callback: this.openConflictsView.bind(this),
     });
+
+    this.addCommand({
+      id: "setup-wizard",
+      name: "Setup wizard",
+      repeatable: false,
+      icon: "settings",
+      callback: () => new OnboardingWizardModal(this).open(),
+    });
   }
 
   async sync() {
-    if (
-      this.settings.githubToken === "" ||
-      this.settings.githubOwner === "" ||
-      this.settings.githubRepo === "" ||
-      this.settings.githubBranch === ""
-    ) {
-      new Notice("Sync plugin not configured");
+    if (!this.isConfigured()) {
+      new Notice("Sync plugin not configured. Use the setup wizard to get started.");
       return;
     }
+
+    // Ensure token is valid before syncing (refresh if needed)
+    const tokenValid = await this.ensureValidToken();
+    if (!tokenValid) return;
     if (this.settings.firstSync) {
       const notice = new Notice("Syncing...");
       try {

@@ -8,6 +8,7 @@ import {
 } from "obsidian";
 import GitHubSyncPlugin from "src/main";
 import { copyToClipboard } from "src/utils";
+import { OnboardingWizardModal } from "src/onboarding-wizard";
 
 export default class GitHubSyncSettingsTab extends PluginSettingTab {
   plugin: GitHubSyncPlugin;
@@ -22,7 +23,23 @@ export default class GitHubSyncSettingsTab extends PluginSettingTab {
 
     containerEl.empty();
 
+    // Quick setup button
+    new Setting(containerEl)
+      .setName("Quick setup")
+      .setDesc("Sign in with GitHub to configure syncing automatically")
+      .addButton((btn) =>
+        btn
+          .setButtonText("Sign in with GitHub")
+          .setCta()
+          .onClick(() => {
+            new OnboardingWizardModal(this.plugin).open();
+          }),
+      );
+
     new Setting(containerEl).setName("Remote Repository").setHeading();
+
+    new Setting(containerEl)
+      .setDesc("Configure manually, or use the quick setup above.")
 
     let tokenInput: TextComponent;
     new Setting(containerEl)
