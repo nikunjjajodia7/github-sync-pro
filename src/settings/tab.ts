@@ -215,6 +215,78 @@ export default class GitHubSyncSettingsTab extends PluginSettingTab {
           });
       });
 
+    new Setting(containerEl)
+      .setName("Sync settings")
+      .setDesc(
+        "Sync Obsidian settings (app.json, appearance.json, hotkeys.json, community-plugins.json) " +
+        "across devices. Workspace files are never synced. Conflicting settings are flagged for manual resolution.",
+      )
+      .addToggle((toggle) => {
+        toggle
+          .setValue(this.plugin.settings.syncSettings)
+          .onChange(async (value) => {
+            this.plugin.settings.syncSettings = value;
+            await this.plugin.saveSettings();
+          });
+      });
+
+    // Pending settings conflicts section
+    const pendingConflicts = this.plugin.settings.pendingSettingsConflicts || [];
+    if (pendingConflicts.length > 0) {
+      new Setting(containerEl)
+        .setName("Pending settings conflicts")
+        .setHeading();
+
+      containerEl.createEl("p", {
+        text: `${pendingConflicts.length} setting${pendingConflicts.length > 1 ? "s" : ""} changed on another device and conflict with your local version.`,
+        cls: "setting-item-description",
+      });
+
+      for (const conflict of pendingConflicts) {
+        new Setting(containerEl)
+          .setName(`${conflict.fileName} → ${conflict.key}`)
+          .setDesc(
+            `Local: ${JSON.stringify(conflict.localValue)?.slice(0, 60) || "undefined"}\n` +
+            `Remote: ${JSON.stringify(conflict.remoteValue)?.slice(0, 60) || "undefined"}`,
+          )
+          .addButton((btn) =>
+            btn.setButtonText("Keep mine").onClick(async () => {
+              // Remove this conflict — local value is already in the merged file
+              this.plugin.settings.pendingSettingsConflicts =
+                this.plugin.settings.pendingSettingsConflicts.filter(
+                  (c) => !(c.fileName === conflict.fileName && c.key === conflict.key),
+                );
+              await this.plugin.saveSettings();
+              this.display(); // refresh UI
+            }),
+          )
+          .addButton((btn) =>
+            btn.setButtonText("Use remote").onClick(async () => {
+              // Apply remote value to local settings file
+              try {
+                const filePath = `${this.plugin.app.vault.configDir}/${conflict.fileName}`;
+                const content = await this.plugin.app.vault.adapter.read(filePath);
+                const json = JSON.parse(content);
+                json[conflict.key] = conflict.remoteValue;
+                await this.plugin.app.vault.adapter.write(
+                  filePath,
+                  JSON.stringify(json, null, 2),
+                );
+              } catch {
+                new Notice(`Failed to apply remote value for ${conflict.key}`);
+              }
+              // Remove conflict
+              this.plugin.settings.pendingSettingsConflicts =
+                this.plugin.settings.pendingSettingsConflicts.filter(
+                  (c) => !(c.fileName === conflict.fileName && c.key === conflict.key),
+                );
+              await this.plugin.saveSettings();
+              this.display();
+            }),
+          );
+      }
+    }
+
     const conflictHandlingOptions = {
       overwriteLocal: "Overwrite local file",
       ask: "Ask",

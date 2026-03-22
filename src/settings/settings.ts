@@ -1,3 +1,11 @@
+export interface PendingSettingsConflictData {
+  fileName: string;
+  key: string;
+  localValue: unknown;
+  remoteValue: unknown;
+  detectedAt: number;
+}
+
 export interface GitHubSyncSettings {
   firstSync: boolean;
   githubToken: string;
@@ -11,6 +19,8 @@ export interface GitHubSyncSettings {
   syncInterval: number;
   syncOnStartup: boolean;
   syncConfigDir: boolean;
+  syncSettings: boolean;
+  pendingSettingsConflicts: PendingSettingsConflictData[];
   excludePatterns: string[];
   conflictHandling: "overwriteLocal" | "ask" | "overwriteRemote";
   conflictViewMode: "default" | "unified" | "split";
@@ -33,6 +43,8 @@ export const DEFAULT_SETTINGS: GitHubSyncSettings = {
   syncInterval: 1,
   syncOnStartup: false,
   syncConfigDir: false,
+  syncSettings: false,
+  pendingSettingsConflicts: [],
   excludePatterns: [],
   conflictHandling: "ask",
   conflictViewMode: "default",
