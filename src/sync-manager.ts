@@ -1386,6 +1386,15 @@ export default class SyncManager {
         }),
     );
 
+    // Clean deleted entries from metadata before uploading manifest.
+    // Once a delete has been synced, the entry serves no purpose and
+    // bloats the manifest (causing stale data on other devices).
+    for (const filePath of Object.keys(this.metadataStore.data.files)) {
+      if (this.metadataStore.data.files[filePath].deleted) {
+        delete this.metadataStore.data.files[filePath];
+      }
+    }
+
     // Update manifest in list of new tree items
     delete treeFiles[`${this.vault.configDir}/${MANIFEST_FILE_NAME}`].sha;
     treeFiles[`${this.vault.configDir}/${MANIFEST_FILE_NAME}`].content =
