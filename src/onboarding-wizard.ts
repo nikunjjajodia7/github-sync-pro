@@ -31,6 +31,7 @@ export class OnboardingWizardModal extends Modal {
   private selectedRepo: string = "";
   private newRepoName: string = "obsidian-vault";
   private abortPolling: boolean = false;
+  private _tokenExpiresIn: number = 0;
 
   constructor(plugin: GitHubSyncPlugin) {
     super(plugin.app);
@@ -145,7 +146,12 @@ export class OnboardingWizardModal extends Modal {
           .setButtonText("Open GitHub")
           .setCta()
           .onClick(() => {
-            window.open(this.verificationUri);
+            // Only open URLs from github.com to prevent open-redirect attacks
+            if (this.verificationUri.startsWith("https://github.com/")) {
+              window.open(this.verificationUri);
+            } else {
+              new Notice("Unexpected verification URL. Please visit github.com/login/device manually.");
+            }
           }),
       );
 
@@ -176,6 +182,7 @@ export class OnboardingWizardModal extends Modal {
 
       this.token = tokenResponse.access_token;
       this.refreshToken = tokenResponse.refresh_token || "";
+      this._tokenExpiresIn = tokenResponse.expires_in || 0;
 
       // Validate and get user info
       this.user = await validateToken(this.token);
@@ -298,8 +305,9 @@ export class OnboardingWizardModal extends Modal {
     this.plugin.settings.githubRepo = repoName;
     this.plugin.settings.githubBranch = "main";
     this.plugin.settings.refreshToken = this.refreshToken;
+    // Use actual expires_in from token response if available, fall back to 8 hours
     this.plugin.settings.tokenExpiresAt = this.refreshToken
-      ? Date.now() + 8 * 60 * 60 * 1000 // 8 hours default
+      ? Date.now() + (this._tokenExpiresIn || 8 * 60 * 60) * 1000
       : 0; // 0 means no expiry
     this.plugin.settings.firstSync = true;
     this.plugin.settings.syncStrategy = "interval";

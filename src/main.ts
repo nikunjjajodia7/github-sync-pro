@@ -25,6 +25,10 @@ export default class GitHubSyncPlugin extends Plugin {
   syncManager: SyncManager;
   logger: Logger;
 
+  // Cache token validation to avoid burning rate limit on every push-on-save
+  private lastTokenValidation: number = 0;
+  private static readonly TOKEN_VALIDATION_CACHE_MS = 5 * 60 * 1000; // 5 minutes
+
   statusBarItem: HTMLElement | null = null;
   syncRibbonIcon: HTMLElement | null = null;
   conflictsRibbonIcon: HTMLElement | null = null;
@@ -92,11 +96,16 @@ export default class GitHubSyncPlugin extends Plugin {
       }
     }
 
-    // Validate the token is still good (lightweight check)
+    // Validate the token is still good (lightweight check, cached for 5 min)
+    if (Date.now() - this.lastTokenValidation < GitHubSyncPlugin.TOKEN_VALIDATION_CACHE_MS) {
+      return true; // recently validated
+    }
     try {
       await validateToken(this.settings.githubToken);
+      this.lastTokenValidation = Date.now();
       return true;
     } catch {
+      this.lastTokenValidation = 0;
       new Notice("GitHub token is invalid. Please re-authenticate in settings.");
       return false;
     }

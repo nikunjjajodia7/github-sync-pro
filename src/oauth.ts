@@ -5,8 +5,8 @@ const DEVICE_CODE_URL = "https://github.com/login/device/code";
 const ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token";
 const GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code";
 
-// Scopes needed: repo access for reading/writing vault files
-const SCOPE = "repo";
+// GitHub Apps use installation-level permissions (set during app registration),
+// not OAuth scopes. No scope parameter needed for Device Flow with GitHub Apps.
 
 // Maximum time to wait for user to authorize (5 minutes)
 const MAX_POLL_DURATION_MS = 5 * 60 * 1000;
@@ -55,7 +55,6 @@ export async function requestDeviceCode(): Promise<DeviceCodeResponse> {
     },
     body: JSON.stringify({
       client_id: CLIENT_ID,
-      scope: SCOPE,
     }),
     throw: false,
   });
