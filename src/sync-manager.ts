@@ -1049,15 +1049,30 @@ export default class SyncManager {
       }
 
       // Folder exists on remote and is not deleted → create locally if missing
+      // But first check: does this folder have any active (non-deleted) files
+      // in the remote manifest? If all files inside are deleted, don't create
+      // the empty shell folder — it was effectively deleted with its contents.
       if (!localFolders[folderPath]) {
-        const normalizedPath = normalizePath(folderPath);
-        try {
-          if (!(await this.vault.adapter.exists(normalizedPath))) {
-            await this.vault.adapter.mkdir(normalizedPath);
-            await this.logger.info("Created folder from remote", folderPath);
+        const folderPrefix = folderPath.endsWith("/") ? folderPath : folderPath + "/";
+        const hasActiveFiles = Object.entries(remoteMetadata.files).some(
+          ([path, meta]) => path.startsWith(folderPrefix) && !meta.deleted
+        );
+        // Also check if the folder itself has any active subfolders in remote
+        const hasActiveSubfolders = Object.entries(remoteFolders).some(
+          ([path, meta]) => path.startsWith(folderPrefix) && path !== folderPath && !meta.deleted
+        );
+
+        if (hasActiveFiles || hasActiveSubfolders || !Object.keys(remoteMetadata.files).some(p => p.startsWith(folderPrefix))) {
+          // Either has active files, active subfolders, or is a genuinely new empty folder
+          const normalizedPath = normalizePath(folderPath);
+          try {
+            if (!(await this.vault.adapter.exists(normalizedPath))) {
+              await this.vault.adapter.mkdir(normalizedPath);
+              await this.logger.info("Created folder from remote", folderPath);
+            }
+          } catch {
+            // Folder creation failed
           }
-        } catch {
-          // Folder creation failed — might be a permissions issue
         }
         localFolders[folderPath] = {
           path: folderPath,
@@ -1714,8 +1729,8 @@ export default class SyncManager {
       };
       await this.metadataStore.save();
     }
-    // Seed folder metadata with all existing local folders.
-    // This ensures pre-existing folders are tracked for cross-device sync.
+    // Seed folder metadata with existing local folders.
+    // Only track folders that are syncable (skip .obsidian, hidden dirs, etc.)
     if (!this.metadataStore.data.folders) {
       this.metadataStore.data.folders = {};
     }
@@ -1729,8 +1744,12 @@ export default class SyncManager {
       try {
         const listing = await this.vault.adapter.list(folder);
         for (const subFolder of listing.folders) {
+          // Skip config dir and anything inside it
           if (subFolder === this.vault.configDir) continue;
           if (subFolder.startsWith(this.vault.configDir + "/")) continue;
+          // Skip hidden folders (starting with .)
+          const folderName = subFolder.split("/").pop() || "";
+          if (folderName.startsWith(".")) continue;
           if (!knownFolders[subFolder]) {
             knownFolders[subFolder] = {
               path: subFolder,
