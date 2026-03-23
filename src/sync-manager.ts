@@ -803,6 +803,9 @@ export default class SyncManager {
     }
 
     if (actions.length === 0) {
+      // Even with no file actions, run gitkeep sync to handle empty folders
+      await this.syncGitkeepFiles();
+
       if (metadataChanged) {
         await this.logger.info(
           "No file actions to sync, committing metadata updates only",
@@ -810,6 +813,16 @@ export default class SyncManager {
         await this.commitSync(newTreeFiles, treeSha);
         return summary;
       }
+
+      // Check if gitkeep created new dirty files that need syncing
+      const hasDirtyGitkeeps = Object.values(this.metadataStore.data.files).some(
+        (f) => f.dirty && f.path.endsWith(".gitkeep") && !f.deleted
+      );
+      if (hasDirtyGitkeeps) {
+        await this.logger.info("New .gitkeep files need syncing, restarting sync");
+        return await this.syncImpl();
+      }
+
       // Nothing to sync
       await this.logger.info("Nothing to sync");
       return summary;
