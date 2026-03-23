@@ -794,6 +794,16 @@ export default class SyncManager {
         switch (action.type) {
           case "upload": {
             const normalizedPath = normalizePath(action.filePath);
+            // Ghost file detection: if the file no longer exists locally,
+            // mark it as deleted in metadata and skip the upload.
+            if (!(await this.vault.adapter.exists(normalizedPath))) {
+              await this.logger.warn("Ghost file detected — marking as deleted", action.filePath);
+              if (this.metadataStore.data.files[action.filePath]) {
+                this.metadataStore.data.files[action.filePath].deleted = true;
+                this.metadataStore.data.files[action.filePath].deletedAt = Date.now();
+              }
+              continue;
+            }
             const resolution = conflictResolutions.find(
               (c: ConflictResolution) => c.filePath === action.filePath,
             );
