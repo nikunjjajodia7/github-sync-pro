@@ -1695,6 +1695,41 @@ export default class SyncManager {
       };
       await this.metadataStore.save();
     }
+    // Seed folder metadata with all existing local folders.
+    // This ensures pre-existing folders are tracked for cross-device sync.
+    if (!this.metadataStore.data.folders) {
+      this.metadataStore.data.folders = {};
+    }
+    const knownFolders = this.metadataStore.data.folders;
+    let foldersAdded = 0;
+    let scanQueue = [this.vault.getRoot().path];
+    while (scanQueue.length > 0) {
+      const folder = scanQueue.pop();
+      if (folder === undefined) continue;
+      if (folder === this.vault.configDir) continue;
+      try {
+        const listing = await this.vault.adapter.list(folder);
+        for (const subFolder of listing.folders) {
+          if (subFolder === this.vault.configDir) continue;
+          if (subFolder.startsWith(this.vault.configDir + "/")) continue;
+          if (!knownFolders[subFolder]) {
+            knownFolders[subFolder] = {
+              path: subFolder,
+              createdAt: Date.now(),
+            };
+            foldersAdded++;
+          }
+          scanQueue.push(subFolder);
+        }
+      } catch {
+        // Skip folders we can't list
+      }
+    }
+    if (foldersAdded > 0) {
+      await this.logger.info("Seeded folder metadata", { foldersAdded });
+      await this.metadataStore.save();
+    }
+
     await this.logger.info("Loaded metadata");
   }
 
