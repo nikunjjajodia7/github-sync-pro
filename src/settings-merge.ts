@@ -104,6 +104,16 @@ export function shallowMergeJSON(
 /**
  * Simple deep equality check for JSON-serializable values.
  */
+function sortKeys(obj: unknown): unknown {
+  if (obj === null || typeof obj !== "object") return obj;
+  if (Array.isArray(obj)) return obj.map(sortKeys);
+  const sorted: Record<string, unknown> = {};
+  for (const key of Object.keys(obj as Record<string, unknown>).sort()) {
+    sorted[key] = sortKeys((obj as Record<string, unknown>)[key]);
+  }
+  return sorted;
+}
+
 function deepEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true;
   if (a === undefined && b === undefined) return true;
@@ -111,6 +121,7 @@ function deepEqual(a: unknown, b: unknown): boolean {
   if (typeof a !== typeof b) return false;
   if (typeof a !== "object") return a === b;
 
-  // Compare as JSON strings for objects/arrays (opaque comparison at this level)
-  return JSON.stringify(a) === JSON.stringify(b);
+  // Compare as sorted JSON strings for objects/arrays (opaque comparison at this level).
+  // Key sorting ensures {a:1, b:2} and {b:2, a:1} are treated as equal.
+  return JSON.stringify(sortKeys(a)) === JSON.stringify(sortKeys(b));
 }

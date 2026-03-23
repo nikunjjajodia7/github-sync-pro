@@ -299,9 +299,15 @@ export class OnboardingWizardModal extends Modal {
   }
 
   private async finishSetup(repoName: string) {
+    if (!this.user) {
+      new Notice("Authentication error — user info unavailable. Please try again.");
+      this.step = "sign-in";
+      this.renderStep();
+      return;
+    }
     // Save all settings
     this.plugin.settings.githubToken = this.token;
-    this.plugin.settings.githubOwner = this.user!.login;
+    this.plugin.settings.githubOwner = this.user.login;
     this.plugin.settings.githubRepo = repoName;
     this.plugin.settings.githubBranch = "main";
     this.plugin.settings.refreshToken = this.refreshToken;
@@ -324,7 +330,7 @@ export class OnboardingWizardModal extends Modal {
     const { contentEl } = this;
 
     contentEl.createEl("p", {
-      text: `Your vault will sync to github.com/${this.user!.login}/${this.plugin.settings.githubRepo}.`,
+      text: `Your vault will sync to github.com/${this.user?.login || ""}/${this.plugin.settings.githubRepo}.`,
     });
 
     contentEl.createEl("p", {

@@ -359,6 +359,7 @@ export default class GithubClient {
 
   /**
    * Get file content at a specific commit SHA.
+   * Uses the Contents API (single file fetch) instead of fetching the entire tree.
    */
   async getFileAtCommit({
     path,
@@ -371,20 +372,21 @@ export default class GithubClient {
     retry?: boolean;
     maxRetries?: number;
   }): Promise<string | null> {
-    // Get the tree at this commit to find the file's blob SHA
-    const treeResponse = await this.request({
-      url: `https://api.github.com/repos/${this.settings.githubOwner}/${this.settings.githubRepo}/git/trees/${commitSha}?recursive=1`,
-      errorMessage: "Failed to get tree at commit",
-      retry,
-      maxRetries,
-    });
-
-    const fileEntry = treeResponse.json.tree.find(
-      (item: any) => item.path === path && item.type === "blob"
-    );
-    if (!fileEntry) return null;
-
-    const blob = await this.getBlob({ sha: fileEntry.sha, retry, maxRetries });
-    return blob.content; // base64 encoded
+    // Validate commitSha format to prevent URL manipulation
+    if (!/^[0-9a-f]{7,40}$/i.test(commitSha)) {
+      throw new Error(`Invalid commit SHA: ${commitSha}`);
+    }
+    try {
+      const response = await this.request({
+        url: this.repoUrl(`/contents/${encodeURIComponent(path)}?ref=${commitSha}`),
+        errorMessage: "Failed to get file at commit",
+        retry,
+        maxRetries,
+      });
+      return response.json.content; // base64 encoded
+    } catch (err: any) {
+      if (err.status === 404) return null;
+      throw err;
+    }
   }
 }

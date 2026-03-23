@@ -164,6 +164,9 @@ export default function VersionHistoryView({ filePath }: VersionHistoryViewProps
       }
       const decoded = decodeBase64String(content);
       await plugin.app.vault.adapter.write(filePath, decoded);
+      // Mark file as dirty in metadata so next sync uploads the restored version
+      // instead of silently overwriting it with the remote version
+      plugin.syncManager.markFileDirty(filePath);
       new Notice(`Restored to version from ${formatDate(commits.find(c => c.sha === sha)?.date || "")}`);
     } catch (err: any) {
       new Notice(`Restore failed: ${err.message}`);

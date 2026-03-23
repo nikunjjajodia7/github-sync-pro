@@ -102,6 +102,14 @@ export default class SyncManager {
       }
       this.pushOnSaveTimer = setTimeout(async () => {
         this.pushOnSaveTimer = null;
+        // If a sync is already running, re-arm the timer to try again
+        if (this.syncing) {
+          this.pushOnSaveTimer = setTimeout(
+            () => this.eventsListener.onDirtyFiles?.(),
+            SyncManager.PUSH_ON_SAVE_DEBOUNCE_MS,
+          );
+          return;
+        }
         await this.sync();
       }, SyncManager.PUSH_ON_SAVE_DEBOUNCE_MS);
     };
@@ -126,6 +134,20 @@ export default class SyncManager {
    */
   isSyncing() {
     return this.syncing;
+  }
+
+  /**
+   * Mark a file as dirty so the next sync uploads it.
+   * Used after version history restore to prevent the remote from overwriting.
+   */
+  markFileDirty(filePath: string) {
+    const meta = this.metadataStore.data.files[filePath];
+    if (meta) {
+      meta.dirty = true;
+      meta.sha = null; // force re-upload
+      meta.lastModified = Date.now();
+    }
+    this.metadataStore.save();
   }
 
   private isTrackablePath(filePath: string, includeManifest: boolean = false): boolean {
@@ -665,8 +687,12 @@ export default class SyncManager {
           await this.logger.info("Auto-merged conflict", conflict.filePath);
           continue;
         }
-      } catch {
-        // Ancestor fetch failed — fall through to manual
+      } catch (err) {
+        // Ancestor fetch failed — fall through to manual resolution
+        await this.logger.warn("Auto-merge ancestor fetch failed, falling back to manual", {
+          filePath: conflict.filePath,
+          error: String(err),
+        });
       }
       remainingConflicts.push(conflict);
     }

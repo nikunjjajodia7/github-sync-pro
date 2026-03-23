@@ -84,8 +84,13 @@ export function matchesExcludePattern(filePath: string, pattern: string): boolea
     .replace(/\?/g, "[^/]") // ? matches one char
     .replace(/\{\{GLOBSTAR\}\}/g, ".*"); // ** matches across segments
 
-  const regex = new RegExp(`^${regexStr}$`);
-  return regex.test(filePath);
+  try {
+    const regex = new RegExp(`^${regexStr}$`);
+    return regex.test(filePath);
+  } catch {
+    // Malformed pattern — treat as non-matching rather than crashing
+    return false;
+  }
 }
 
 /**

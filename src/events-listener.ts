@@ -11,6 +11,7 @@ import { isTrackableSyncPath } from "./sync-scope";
  */
 export default class EventsListener {
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
+  private hasPendingDirtyChanges: boolean = false;
   private static readonly SAVE_DEBOUNCE_MS = 500;
 
   // Callback invoked when dirty files are detected after debounce.
@@ -29,13 +30,19 @@ export default class EventsListener {
    * (e.g., keystrokes) will coalesce into a single disk write.
    */
   private scheduleSave(hasDirtyChanges: boolean = false) {
+    // Sticky flag: once any event in this debounce window marks dirty, it stays dirty
+    if (hasDirtyChanges) {
+      this.hasPendingDirtyChanges = true;
+    }
     if (this.saveTimer !== null) {
       clearTimeout(this.saveTimer);
     }
     this.saveTimer = setTimeout(async () => {
       this.saveTimer = null;
+      const shouldNotify = this.hasPendingDirtyChanges;
+      this.hasPendingDirtyChanges = false;
       await this.metadataStore.save();
-      if (hasDirtyChanges && this.onDirtyFiles) {
+      if (shouldNotify && this.onDirtyFiles) {
         this.onDirtyFiles();
       }
     }, EventsListener.SAVE_DEBOUNCE_MS);
