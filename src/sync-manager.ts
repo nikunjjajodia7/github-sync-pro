@@ -338,9 +338,9 @@ export default class SyncManager {
           return;
         }
 
-        if (targetPath.split("/").last()?.startsWith(".")) {
-          // We must skip hidden files as that creates issues with syncing.
-          // This is fine as users can't edit hidden files in Obsidian anyway.
+        const fileName = targetPath.split("/").last() ?? "";
+        if (fileName.startsWith(".") && fileName !== ".gitkeep") {
+          // Skip hidden files except .gitkeep (used for empty folder sync).
           await this.logger.info("Skipping hidden file", targetPath);
           return;
         }
@@ -998,114 +998,126 @@ export default class SyncManager {
       await this.commitSync(newTreeFiles, treeSha);
     }
 
-    // Folder sync: create/delete folders based on cross-device metadata
-    await this.syncFolders(remoteMetadata);
+    // Folder sync via .gitkeep: after file sync completes, ensure empty
+    // folders have a .gitkeep file so Git tracks them. Remove .gitkeep
+    // from folders that now have real files. This converts folder sync
+    // into regular file sync — no separate metadata layer needed.
+    await this.syncGitkeepFiles();
 
     return summary;
   }
 
+  private static readonly GITKEEP_NAME = ".gitkeep";
+
   /**
-   * Sync folders between devices. Handles two cases:
-   * 1. Folder created on another device → create it locally
-   * 2. Folder deleted on another device → delete it locally (only if explicitly deleted)
+   * Sync empty folders via .gitkeep placeholder files.
+   *
+   * Instead of a separate folder metadata system, we use the standard Git
+   * approach: a .gitkeep file inside empty folders. The existing file sync
+   * handles everything — create, delete, conflict resolution all work
+   * because .gitkeep is just a regular file.
+   *
+   * After each sync cycle:
+   * 1. Scan local vault for empty folders → create .gitkeep in each
+   * 2. Scan for .gitkeep files in folders that now have real files → delete them
+   * 3. Scan for empty folders that only exist because .gitkeep was deleted → remove folder
    */
-  private async syncFolders(remoteMetadata: Metadata) {
-    if (!this.metadataStore.data.folders) {
-      this.metadataStore.data.folders = {};
-    }
-    const localFolders = this.metadataStore.data.folders;
-    const remoteFolders = remoteMetadata.folders || {};
+  private async syncGitkeepFiles() {
     let changed = false;
+    const configDir = this.vault.configDir;
 
-    // Create folders that exist in remote metadata but not locally
-    for (const [folderPath, remoteMeta] of Object.entries(remoteFolders)) {
-      if (remoteMeta.deleted) {
-        // Folder was deleted on the other device
-        if (!localFolders[folderPath]?.deleted) {
-          const normalizedPath = normalizePath(folderPath);
-          try {
-            if (await this.vault.adapter.exists(normalizedPath)) {
-              // Check if folder is empty before deleting
-              const listing = await this.vault.adapter.list(normalizedPath);
-              if (listing.files.length === 0 && listing.folders.length === 0) {
-                await this.vault.adapter.rmdir(normalizedPath, false);
-                await this.logger.info("Deleted folder from remote signal", folderPath);
-              } else {
-                await this.logger.info("Skipped non-empty folder delete", folderPath);
-              }
-            }
-          } catch {
-            // Folder may already be gone
-          }
-          localFolders[folderPath] = {
-            path: folderPath,
-            createdAt: remoteMeta.createdAt,
-            deleted: true,
-            deletedAt: remoteMeta.deletedAt,
-          };
-          changed = true;
-        }
-        continue;
-      }
+    // Walk all folders in the vault
+    const foldersToScan: string[] = [this.vault.getRoot().path];
+    while (foldersToScan.length > 0) {
+      const folder = foldersToScan.pop();
+      if (folder === undefined) continue;
+      if (folder === configDir || folder.startsWith(configDir + "/")) continue;
 
-      // Folder exists on remote and is not deleted → create locally if missing
-      // But first check: does this folder have any active (non-deleted) files
-      // in the remote manifest? If all files inside are deleted, don't create
-      // the empty shell folder — it was effectively deleted with its contents.
-      if (!localFolders[folderPath]) {
-        const folderPrefix = folderPath.endsWith("/") ? folderPath : folderPath + "/";
-        const hasActiveFiles = Object.entries(remoteMetadata.files).some(
-          ([path, meta]) => path.startsWith(folderPrefix) && !meta.deleted
-        );
-        // Also check if the folder itself has any active subfolders in remote
-        const hasActiveSubfolders = Object.entries(remoteFolders).some(
-          ([path, meta]) => path.startsWith(folderPrefix) && path !== folderPath && !meta.deleted
-        );
-
-        if (hasActiveFiles || hasActiveSubfolders || !Object.keys(remoteMetadata.files).some(p => p.startsWith(folderPrefix))) {
-          // Either has active files, active subfolders, or is a genuinely new empty folder
-          const normalizedPath = normalizePath(folderPath);
-          try {
-            if (!(await this.vault.adapter.exists(normalizedPath))) {
-              await this.vault.adapter.mkdir(normalizedPath);
-              await this.logger.info("Created folder from remote", folderPath);
-            }
-          } catch {
-            // Folder creation failed
-          }
-        }
-        localFolders[folderPath] = {
-          path: folderPath,
-          createdAt: remoteMeta.createdAt,
-        };
-        changed = true;
-      }
-    }
-
-    // Upload local folders that remote doesn't know about
-    for (const [folderPath, localMeta] of Object.entries(localFolders)) {
-      if (!remoteFolders[folderPath] && !localMeta.deleted) {
-        // New local folder — remote will see it on next manifest upload
-        changed = true;
-      }
-    }
-
-    // Detect folders that exist in local metadata but no longer exist on disk.
-    // This catches folders that were deleted locally (e.g., via Obsidian or
-    // manually) but the delete event was missed. Mark them as deleted so the
-    // deletion propagates to other devices.
-    for (const [folderPath, localMeta] of Object.entries(localFolders)) {
-      if (localMeta.deleted) continue;
-      const normalizedPath = normalizePath(folderPath);
       try {
-        if (!(await this.vault.adapter.exists(normalizedPath))) {
-          localFolders[folderPath].deleted = true;
-          localFolders[folderPath].deletedAt = Date.now();
-          changed = true;
-          await this.logger.info("Detected missing folder — marking as deleted", folderPath);
+        const listing = await this.vault.adapter.list(folder);
+
+        // Queue subfolders for scanning
+        for (const sub of listing.folders) {
+          if (sub === configDir || sub.startsWith(configDir + "/")) continue;
+          const name = sub.split("/").pop() || "";
+          if (name.startsWith(".")) continue;
+          foldersToScan.push(sub);
+        }
+
+        // Count real files (non-.gitkeep) and check for .gitkeep
+        const realFiles = listing.files.filter(
+          (f) => !f.endsWith("/" + SyncManager.GITKEEP_NAME) && f !== SyncManager.GITKEEP_NAME
+        );
+        const gitkeepPath = folder === ""
+          ? SyncManager.GITKEEP_NAME
+          : normalizePath(`${folder}/${SyncManager.GITKEEP_NAME}`);
+        const hasGitkeep = listing.files.some(
+          (f) => f === gitkeepPath
+        );
+        const hasSubfolders = listing.folders.filter(
+          (f) => f !== configDir && !f.startsWith(configDir + "/")
+        ).length > 0;
+
+        if (realFiles.length === 0 && !hasSubfolders && !hasGitkeep) {
+          // Empty folder with no .gitkeep → create one
+          // Skip the vault root
+          if (folder !== "" && folder !== this.vault.getRoot().path) {
+            await this.vault.adapter.write(gitkeepPath, "");
+            // Track in metadata so it syncs
+            this.metadataStore.data.files[gitkeepPath] = {
+              path: gitkeepPath,
+              sha: null,
+              dirty: true,
+              justDownloaded: false,
+              lastModified: Date.now(),
+            };
+            changed = true;
+            await this.logger.info("Created .gitkeep for empty folder", folder);
+          }
+        } else if (realFiles.length > 0 && hasGitkeep) {
+          // Folder has real files AND a .gitkeep → remove the .gitkeep
+          try {
+            await this.vault.adapter.remove(gitkeepPath);
+            if (this.metadataStore.data.files[gitkeepPath]) {
+              this.metadataStore.data.files[gitkeepPath].deleted = true;
+              this.metadataStore.data.files[gitkeepPath].deletedAt = Date.now();
+            }
+            changed = true;
+            await this.logger.info("Removed .gitkeep (folder has real files)", folder);
+          } catch {
+            // .gitkeep removal failed — not critical
+          }
         }
       } catch {
-        // Skip on error
+        // Skip folders we can't list
+      }
+    }
+
+    // Clean up empty folders where .gitkeep was deleted by another device.
+    // If a folder has no files, no subfolders, and no .gitkeep, it's a
+    // leftover from a deleted .gitkeep → remove the empty folder.
+    const foldersToCheck: string[] = [this.vault.getRoot().path];
+    while (foldersToCheck.length > 0) {
+      const folder = foldersToCheck.pop();
+      if (folder === undefined) continue;
+      if (folder === configDir || folder.startsWith(configDir + "/")) continue;
+      if (folder === "" || folder === this.vault.getRoot().path) continue;
+
+      try {
+        const listing = await this.vault.adapter.list(folder);
+        if (listing.files.length === 0 && listing.folders.length === 0) {
+          await this.vault.adapter.rmdir(folder, false);
+          await this.logger.info("Removed empty folder (gitkeep deleted)", folder);
+        } else {
+          for (const sub of listing.folders) {
+            if (sub === configDir) continue;
+            const name = sub.split("/").pop() || "";
+            if (name.startsWith(".")) continue;
+            foldersToCheck.push(sub);
+          }
+        }
+      } catch {
+        // Skip
       }
     }
 
@@ -1555,14 +1567,9 @@ export default class SyncManager {
         delete this.metadataStore.data.files[filePath];
       }
     }
-    // Same retention cleanup for folders
+    // Clean up legacy folder metadata (replaced by .gitkeep files)
     if (this.metadataStore.data.folders) {
-      for (const folderPath of Object.keys(this.metadataStore.data.folders)) {
-        const entry = this.metadataStore.data.folders[folderPath];
-        if (entry.deleted && entry.deletedAt && (now - (entry.deletedAt as number)) > DELETED_RETENTION_MS) {
-          delete this.metadataStore.data.folders[folderPath];
-        }
-      }
+      delete this.metadataStore.data.folders;
     }
 
     // Update manifest in list of new tree items
@@ -1729,45 +1736,6 @@ export default class SyncManager {
       };
       await this.metadataStore.save();
     }
-    // Seed folder metadata with existing local folders.
-    // Only track folders that are syncable (skip .obsidian, hidden dirs, etc.)
-    if (!this.metadataStore.data.folders) {
-      this.metadataStore.data.folders = {};
-    }
-    const knownFolders = this.metadataStore.data.folders;
-    let foldersAdded = 0;
-    let scanQueue = [this.vault.getRoot().path];
-    while (scanQueue.length > 0) {
-      const folder = scanQueue.pop();
-      if (folder === undefined) continue;
-      if (folder === this.vault.configDir) continue;
-      try {
-        const listing = await this.vault.adapter.list(folder);
-        for (const subFolder of listing.folders) {
-          // Skip config dir and anything inside it
-          if (subFolder === this.vault.configDir) continue;
-          if (subFolder.startsWith(this.vault.configDir + "/")) continue;
-          // Skip hidden folders (starting with .)
-          const folderName = subFolder.split("/").pop() || "";
-          if (folderName.startsWith(".")) continue;
-          if (!knownFolders[subFolder]) {
-            knownFolders[subFolder] = {
-              path: subFolder,
-              createdAt: Date.now(),
-            };
-            foldersAdded++;
-          }
-          scanQueue.push(subFolder);
-        }
-      } catch {
-        // Skip folders we can't list
-      }
-    }
-    if (foldersAdded > 0) {
-      await this.logger.info("Seeded folder metadata", { foldersAdded });
-      await this.metadataStore.save();
-    }
-
     await this.logger.info("Loaded metadata");
   }
 

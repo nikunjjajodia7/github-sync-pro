@@ -58,29 +58,15 @@ export default class EventsListener {
     plugin.registerEvent(this.vault.on("rename", this.onRename.bind(this)));
   }
 
-  private ensureFoldersMap() {
-    if (!this.metadataStore.data.folders) {
-      this.metadataStore.data.folders = {};
-    }
-  }
-
   private async onCreate(file: TAbstractFile) {
     await this.logger.info("Received create event", file.path);
-    if (!this.isSyncable(file.path) && !(file instanceof TFolder)) {
+    if (!this.isSyncable(file.path)) {
       await this.logger.info("Skipped created file", file.path);
       return;
     }
     if (file instanceof TFolder) {
-      // Track folder creation for cross-device sync
-      this.ensureFoldersMap();
-      if (!this.metadataStore.data.folders![file.path]) {
-        this.metadataStore.data.folders![file.path] = {
-          path: file.path,
-          createdAt: Date.now(),
-        };
-        this.scheduleSave(true);
-        await this.logger.info("Tracked new folder", file.path);
-      }
+      // Folders are synced via .gitkeep files, not metadata tracking.
+      // syncGitkeepFiles() handles this after each sync cycle.
       return;
     }
 
@@ -112,8 +98,8 @@ export default class EventsListener {
 
     if (file instanceof TFolder) {
       // When a folder is deleted, Obsidian fires ONE event for the folder,
-      // not individual events for each file inside it. We need to mark all
-      // tracked files under this folder as deleted.
+      // not individual events for each file inside it. Mark all tracked
+      // files under this folder as deleted (including .gitkeep files).
       const folderPath = filePath.endsWith("/") ? filePath : filePath + "/";
       let count = 0;
       for (const trackedPath of Object.keys(this.metadataStore.data.files)) {
@@ -123,26 +109,10 @@ export default class EventsListener {
           count++;
         }
       }
-
-      // Track the folder deletion itself so other devices remove it
-      this.ensureFoldersMap();
-      const folders = this.metadataStore.data.folders!;
-      // Mark this folder and all subfolders as deleted
-      folders[filePath] = {
-        path: filePath,
-        createdAt: folders[filePath]?.createdAt || Date.now(),
-        deleted: true,
-        deletedAt: Date.now(),
-      };
-      for (const trackedFolder of Object.keys(folders)) {
-        if (trackedFolder.startsWith(folderPath) && !folders[trackedFolder].deleted) {
-          folders[trackedFolder].deleted = true;
-          folders[trackedFolder].deletedAt = Date.now();
-        }
+      if (count > 0) {
+        this.scheduleSave(true);
+        await this.logger.info("Marked files in deleted folder", { folderPath, fileCount: count });
       }
-
-      this.scheduleSave(true);
-      await this.logger.info("Marked folder and contents as deleted", { folderPath, fileCount: count });
       return;
     }
 
