@@ -786,7 +786,10 @@ export default class SyncManager {
     // files uploaded when mode was "broad") that are now invisible to the sync
     // system. Since base_tree preserves all files, they persist forever unless
     // we explicitly remove them with sha=null.
+    const manifestPath = `${this.vault.configDir}/${MANIFEST_FILE_NAME}`;
     for (const filePath of Object.keys(files)) {
+      // Never orphan-sweep the manifest file — it's managed by commitSync
+      if (filePath === manifestPath) continue;
       if (this.shouldSkipSyncPath(filePath)) {
         // File is in remote tree but NOT trackable — it's an orphan
         if (!actions.find((a) => a.filePath === filePath)) {
