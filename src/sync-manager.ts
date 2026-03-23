@@ -592,6 +592,18 @@ export default class SyncManager {
       metadataChanged = true;
     }
 
+    // Detect stale deleted entries in remote manifest that local already cleaned.
+    // This ensures the remote manifest gets updated even when no files changed.
+    const remoteDeletedCount = Object.values(remoteMetadata.files).filter(
+      (f: FileMetadata) => f.deleted,
+    ).length;
+    if (remoteDeletedCount > 0) {
+      await this.logger.info("Remote manifest has stale deleted entries", {
+        remoteDeletedCount,
+      });
+      metadataChanged = true;
+    }
+
     // Reconcile remote metadata with the actual remote tree state to support
     // changes made outside of this plugin (PRs/direct commits/other tools).
     Object.keys(files).forEach((filePath: string) => {
