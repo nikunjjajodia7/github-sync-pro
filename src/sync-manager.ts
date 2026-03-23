@@ -998,7 +998,86 @@ export default class SyncManager {
       await this.commitSync(newTreeFiles, treeSha);
     }
 
+    // Folder sync: create/delete folders based on cross-device metadata
+    await this.syncFolders(remoteMetadata);
+
     return summary;
+  }
+
+  /**
+   * Sync folders between devices. Handles two cases:
+   * 1. Folder created on another device → create it locally
+   * 2. Folder deleted on another device → delete it locally (only if explicitly deleted)
+   */
+  private async syncFolders(remoteMetadata: Metadata) {
+    if (!this.metadataStore.data.folders) {
+      this.metadataStore.data.folders = {};
+    }
+    const localFolders = this.metadataStore.data.folders;
+    const remoteFolders = remoteMetadata.folders || {};
+    let changed = false;
+
+    // Create folders that exist in remote metadata but not locally
+    for (const [folderPath, remoteMeta] of Object.entries(remoteFolders)) {
+      if (remoteMeta.deleted) {
+        // Folder was deleted on the other device
+        if (!localFolders[folderPath]?.deleted) {
+          const normalizedPath = normalizePath(folderPath);
+          try {
+            if (await this.vault.adapter.exists(normalizedPath)) {
+              // Check if folder is empty before deleting
+              const listing = await this.vault.adapter.list(normalizedPath);
+              if (listing.files.length === 0 && listing.folders.length === 0) {
+                await this.vault.adapter.rmdir(normalizedPath, false);
+                await this.logger.info("Deleted folder from remote signal", folderPath);
+              } else {
+                await this.logger.info("Skipped non-empty folder delete", folderPath);
+              }
+            }
+          } catch {
+            // Folder may already be gone
+          }
+          localFolders[folderPath] = {
+            path: folderPath,
+            createdAt: remoteMeta.createdAt,
+            deleted: true,
+            deletedAt: remoteMeta.deletedAt,
+          };
+          changed = true;
+        }
+        continue;
+      }
+
+      // Folder exists on remote and is not deleted → create locally if missing
+      if (!localFolders[folderPath]) {
+        const normalizedPath = normalizePath(folderPath);
+        try {
+          if (!(await this.vault.adapter.exists(normalizedPath))) {
+            await this.vault.adapter.mkdir(normalizedPath);
+            await this.logger.info("Created folder from remote", folderPath);
+          }
+        } catch {
+          // Folder creation failed — might be a permissions issue
+        }
+        localFolders[folderPath] = {
+          path: folderPath,
+          createdAt: remoteMeta.createdAt,
+        };
+        changed = true;
+      }
+    }
+
+    // Upload local folders that remote doesn't know about
+    for (const [folderPath, localMeta] of Object.entries(localFolders)) {
+      if (!remoteFolders[folderPath] && !localMeta.deleted) {
+        // New local folder — remote will see it on next manifest upload
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      await this.metadataStore.save();
+    }
   }
 
   /**
@@ -1440,6 +1519,15 @@ export default class SyncManager {
       const entry = this.metadataStore.data.files[filePath];
       if (entry.deleted && entry.deletedAt && (now - entry.deletedAt) > DELETED_RETENTION_MS) {
         delete this.metadataStore.data.files[filePath];
+      }
+    }
+    // Same retention cleanup for folders
+    if (this.metadataStore.data.folders) {
+      for (const folderPath of Object.keys(this.metadataStore.data.folders)) {
+        const entry = this.metadataStore.data.folders[folderPath];
+        if (entry.deleted && entry.deletedAt && (now - (entry.deletedAt as number)) > DELETED_RETENTION_MS) {
+          delete this.metadataStore.data.folders[folderPath];
+        }
       }
     }
 

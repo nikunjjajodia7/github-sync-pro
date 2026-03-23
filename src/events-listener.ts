@@ -58,15 +58,29 @@ export default class EventsListener {
     plugin.registerEvent(this.vault.on("rename", this.onRename.bind(this)));
   }
 
+  private ensureFoldersMap() {
+    if (!this.metadataStore.data.folders) {
+      this.metadataStore.data.folders = {};
+    }
+  }
+
   private async onCreate(file: TAbstractFile) {
     await this.logger.info("Received create event", file.path);
-    if (!this.isSyncable(file.path)) {
-      // The file has not been created in directory that we're syncing with GitHub
+    if (!this.isSyncable(file.path) && !(file instanceof TFolder)) {
       await this.logger.info("Skipped created file", file.path);
       return;
     }
     if (file instanceof TFolder) {
-      // Skip folders
+      // Track folder creation for cross-device sync
+      this.ensureFoldersMap();
+      if (!this.metadataStore.data.folders![file.path]) {
+        this.metadataStore.data.folders![file.path] = {
+          path: file.path,
+          createdAt: Date.now(),
+        };
+        this.scheduleSave(true);
+        await this.logger.info("Tracked new folder", file.path);
+      }
       return;
     }
 
@@ -109,10 +123,26 @@ export default class EventsListener {
           count++;
         }
       }
-      if (count > 0) {
-        this.scheduleSave(true);
-        await this.logger.info("Marked files in deleted folder", { folderPath, count });
+
+      // Track the folder deletion itself so other devices remove it
+      this.ensureFoldersMap();
+      const folders = this.metadataStore.data.folders!;
+      // Mark this folder and all subfolders as deleted
+      folders[filePath] = {
+        path: filePath,
+        createdAt: folders[filePath]?.createdAt || Date.now(),
+        deleted: true,
+        deletedAt: Date.now(),
+      };
+      for (const trackedFolder of Object.keys(folders)) {
+        if (trackedFolder.startsWith(folderPath) && !folders[trackedFolder].deleted) {
+          folders[trackedFolder].deleted = true;
+          folders[trackedFolder].deletedAt = Date.now();
+        }
       }
+
+      this.scheduleSave(true);
+      await this.logger.info("Marked folder and contents as deleted", { folderPath, fileCount: count });
       return;
     }
 

@@ -34,9 +34,20 @@ export interface FileMetadata {
   ancestorSha?: string | null;
 }
 
+export interface FolderMetadata {
+  path: string;
+  // When the folder was first tracked
+  createdAt: number;
+  // Whether the folder was explicitly deleted
+  deleted?: boolean | null;
+  // When the folder was deleted
+  deletedAt?: number | null;
+}
+
 export interface Metadata {
   lastSync: number;
   files: { [key: string]: FileMetadata };
+  folders?: { [key: string]: FolderMetadata };
 }
 
 /**
