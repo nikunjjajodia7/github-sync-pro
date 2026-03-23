@@ -369,10 +369,14 @@ export default class SyncManager {
           dirty: false,
           justDownloaded: true,
           lastModified: Date.now(),
+          ancestorSha: files[normalizedPath].sha,
         };
-        await this.metadataStore.save();
       }),
     );
+
+    // Save metadata once after all files are extracted, not per-file.
+    // For a 1000-file vault this avoids 1000 sequential disk writes.
+    await this.metadataStore.save();
 
     await this.logger.info("Extracted zip");
 
@@ -1443,12 +1447,15 @@ export default class SyncManager {
       normalizedPath,
       base64ToArrayBuffer(blob.content),
     );
+    // Store current sha as ancestor before updating (enables diff3 on next conflict)
+    const previousSha = this.metadataStore.data.files[file.path]?.sha || null;
     this.metadataStore.data.files[file.path] = {
       path: file.path,
       sha: file.sha,
       dirty: false,
       justDownloaded: true,
       lastModified: lastModified,
+      ancestorSha: previousSha || file.sha,
     };
     await this.metadataStore.save();
   }
