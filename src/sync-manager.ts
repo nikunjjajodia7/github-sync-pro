@@ -1075,6 +1075,25 @@ export default class SyncManager {
       }
     }
 
+    // Detect folders that exist in local metadata but no longer exist on disk.
+    // This catches folders that were deleted locally (e.g., via Obsidian or
+    // manually) but the delete event was missed. Mark them as deleted so the
+    // deletion propagates to other devices.
+    for (const [folderPath, localMeta] of Object.entries(localFolders)) {
+      if (localMeta.deleted) continue;
+      const normalizedPath = normalizePath(folderPath);
+      try {
+        if (!(await this.vault.adapter.exists(normalizedPath))) {
+          localFolders[folderPath].deleted = true;
+          localFolders[folderPath].deletedAt = Date.now();
+          changed = true;
+          await this.logger.info("Detected missing folder — marking as deleted", folderPath);
+        }
+      } catch {
+        // Skip on error
+      }
+    }
+
     if (changed) {
       await this.metadataStore.save();
     }

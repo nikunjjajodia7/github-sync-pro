@@ -1,7 +1,7 @@
 {
   "id": "github-gitless-sync-enhanced",
   "name": "GitHub Sync Pro",
-  "version": "1.2.7-beta",
+  "version": "1.2.8-beta",
   "minAppVersion": "1.7.7",
   "description": "Free Obsidian Sync alternative: zero-config GitHub sync with OAuth, version history, selective sync, auto-merge, and push-on-save.",
   "author": "nikunjjajodia7",
