@@ -120,6 +120,10 @@ export function isTrackableSyncPath(
   if (filePath === manifestPath) {
     return includeManifest;
   }
+  // .gitkeep files are always trackable — they're used for empty folder sync
+  if (filePath.endsWith("/.gitkeep") || filePath === ".gitkeep") {
+    return true;
+  }
   if (
     filePath === `${configDir}/workspace.json` ||
     filePath === `${configDir}/workspace-mobile.json` ||
