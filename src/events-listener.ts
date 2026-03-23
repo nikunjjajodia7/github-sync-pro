@@ -95,10 +95,27 @@ export default class EventsListener {
   private async onDelete(file: TAbstractFile | string) {
     const filePath = file instanceof TAbstractFile ? file.path : file;
     await this.logger.info("Received delete event", filePath);
+
     if (file instanceof TFolder) {
-      // Skip folders
+      // When a folder is deleted, Obsidian fires ONE event for the folder,
+      // not individual events for each file inside it. We need to mark all
+      // tracked files under this folder as deleted.
+      const folderPath = filePath.endsWith("/") ? filePath : filePath + "/";
+      let count = 0;
+      for (const trackedPath of Object.keys(this.metadataStore.data.files)) {
+        if (trackedPath.startsWith(folderPath) && !this.metadataStore.data.files[trackedPath].deleted) {
+          this.metadataStore.data.files[trackedPath].deleted = true;
+          this.metadataStore.data.files[trackedPath].deletedAt = Date.now();
+          count++;
+        }
+      }
+      if (count > 0) {
+        this.scheduleSave(true);
+        await this.logger.info("Marked files in deleted folder", { folderPath, count });
+      }
       return;
     }
+
     if (!this.isSyncable(filePath)) {
       // The file was not in directory that we're syncing with GitHub
       return;
