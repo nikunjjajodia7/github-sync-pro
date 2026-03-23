@@ -1,9 +1,9 @@
 {
   "id": "github-gitless-sync-enhanced",
   "name": "GitHub Sync Pro",
-  "version": "1.1.6",
+  "version": "1.2.0",
   "minAppVersion": "1.7.7",
-  "description": "Enhanced fork: fixes external file sync, delete propagation, and stability issues for cross-device vault sync.",
+  "description": "Free Obsidian Sync alternative: zero-config GitHub sync with OAuth, version history, selective sync, auto-merge, and push-on-save.",
   "author": "nikunjjajodia7",
   "authorUrl": "https://github.com/nikunjjajodia7",
   "fundingUrl": "https://ko-fi.com/silvanocerza",
