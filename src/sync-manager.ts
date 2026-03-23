@@ -844,9 +844,20 @@ export default class SyncManager {
           }
           case "delete_remote": {
             if (!newTreeFiles[action.filePath]) {
-              throw new Error("Missing remote tree item for delete_remote");
+              // File already absent from remote tree — create a tree entry
+              // with sha=null to ensure Git removes it in the commit.
+              // This was a regression in v1.1.6 where we threw instead of
+              // handling the case where the file was already gone from the tree
+              // but still tracked in metadata.
+              newTreeFiles[action.filePath] = {
+                path: action.filePath,
+                mode: "100644",
+                type: "blob",
+                sha: null,
+              };
+            } else {
+              newTreeFiles[action.filePath].sha = null;
             }
-            newTreeFiles[action.filePath].sha = null;
             preparedRemoteActions.push(action);
             break;
           }
