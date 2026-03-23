@@ -104,7 +104,7 @@ export function shallowMergeJSON(
 /**
  * Simple deep equality check for JSON-serializable values.
  */
-function sortKeys(obj: unknown): unknown {
+export function sortKeys(obj: unknown): unknown {
   if (obj === null || typeof obj !== "object") return obj;
   if (Array.isArray(obj)) return obj.map(sortKeys);
   const sorted: Record<string, unknown> = {};

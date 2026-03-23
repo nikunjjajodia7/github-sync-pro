@@ -171,15 +171,12 @@ export default class GithubClient {
       maxRetries,
     });
 
-    const files = response.json.tree
-      .filter((file: GetTreeResponseItem) => file.type === "blob")
-      .reduce(
-        (
-          acc: { [key: string]: GetTreeResponseItem },
-          file: GetTreeResponseItem,
-        ) => ({ ...acc, [file.path]: file }),
-        {},
-      );
+    const files: { [key: string]: GetTreeResponseItem } = {};
+    for (const file of response.json.tree) {
+      if (file.type === "blob") {
+        files[file.path] = file;
+      }
+    }
     return { files, sha: response.json.sha };
   }
 

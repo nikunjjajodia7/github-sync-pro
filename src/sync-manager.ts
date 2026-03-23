@@ -100,7 +100,7 @@ export default class SyncManager {
       if (this.pushOnSaveTimer !== null) {
         clearTimeout(this.pushOnSaveTimer);
       }
-      this.pushOnSaveTimer = setTimeout(async () => {
+      this.pushOnSaveTimer = setTimeout(() => {
         this.pushOnSaveTimer = null;
         // If a sync is already running, re-arm the timer to try again
         if (this.syncing) {
@@ -110,7 +110,10 @@ export default class SyncManager {
           );
           return;
         }
-        await this.sync();
+        this.sync().catch(() => {
+          // Errors are already handled inside sync() via Notice.
+          // Catch here to prevent unhandled promise rejection from setTimeout.
+        });
       }, SyncManager.PUSH_ON_SAVE_DEBOUNCE_MS);
     };
   }
@@ -1639,6 +1642,11 @@ export default class SyncManager {
     if (this.syncIntervalId) {
       window.clearInterval(this.syncIntervalId);
       this.syncIntervalId = null;
+    }
+    // Also clear push-on-save timer to prevent firing after unload
+    if (this.pushOnSaveTimer !== null) {
+      clearTimeout(this.pushOnSaveTimer);
+      this.pushOnSaveTimer = null;
     }
   }
 

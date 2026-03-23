@@ -75,6 +75,10 @@ export function hasTextExtension(filePath: string) {
  * @param backoffFactor - Multiplicative factor for delay between retries (default: 2)
  * @returns The result of the function execution
  */
+export function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export async function retryUntil<T>(
   fn: () => Promise<T>,
   condition: (result: T) => boolean,

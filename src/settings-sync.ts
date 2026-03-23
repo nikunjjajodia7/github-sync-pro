@@ -1,5 +1,5 @@
 import { Vault, normalizePath } from "obsidian";
-import { shallowMergeJSON, PendingSettingsConflict } from "./settings-merge";
+import { shallowMergeJSON, sortKeys } from "./settings-merge";
 import { GitHubSyncSettings, PendingSettingsConflictData } from "./settings/settings";
 import GithubClient from "./github/client";
 import Logger from "./logger";
@@ -82,8 +82,8 @@ export async function syncSettingsFiles({
         continue;
       }
 
-      // If they're identical, nothing to do
-      if (JSON.stringify(localJSON) === JSON.stringify(remoteJSON)) continue;
+      // If they're identical (key-order-insensitive), nothing to do
+      if (JSON.stringify(sortKeys(localJSON)) === JSON.stringify(sortKeys(remoteJSON))) continue;
 
       // Use the remote version as the "ancestor" for first sync of settings.
       // On subsequent syncs we'd need a stored ancestor — for now we merge

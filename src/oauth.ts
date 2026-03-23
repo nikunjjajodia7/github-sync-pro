@@ -1,9 +1,18 @@
 import { requestUrl, Notice } from "obsidian";
+import { sleep } from "./utils";
 
 const CLIENT_ID = "Iv23liwq8PhSpVtHGahx";
 const DEVICE_CODE_URL = "https://github.com/login/device/code";
 const ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token";
 const GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code";
+
+function githubAuthHeaders(token: string) {
+  return {
+    Accept: "application/vnd.github+json",
+    Authorization: `Bearer ${token}`,
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
+}
 
 // GitHub Apps use installation-level permissions (set during app registration),
 // not OAuth scopes. No scope parameter needed for Device Flow with GitHub Apps.
@@ -163,11 +172,7 @@ export async function refreshAccessToken(
 export async function validateToken(token: string): Promise<GitHubUser> {
   const response = await requestUrl({
     url: "https://api.github.com/user",
-    headers: {
-      Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${token}`,
-      "X-GitHub-Api-Version": "2022-11-28",
-    },
+    headers: githubAuthHeaders(token),
     throw: false,
   });
 
@@ -188,11 +193,7 @@ export async function listUserRepos(
 ): Promise<GitHubRepo[]> {
   const response = await requestUrl({
     url: "https://api.github.com/user/repos?sort=updated&per_page=100&affiliation=owner",
-    headers: {
-      Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${token}`,
-      "X-GitHub-Api-Version": "2022-11-28",
-    },
+    headers: githubAuthHeaders(token),
     throw: false,
   });
 
@@ -213,11 +214,7 @@ export async function createRepo(
   const response = await requestUrl({
     url: "https://api.github.com/user/repos",
     method: "POST",
-    headers: {
-      Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${token}`,
-      "X-GitHub-Api-Version": "2022-11-28",
-    },
+    headers: githubAuthHeaders(token),
     body: JSON.stringify({
       name,
       description,
@@ -236,6 +233,3 @@ export async function createRepo(
   return response.json;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}

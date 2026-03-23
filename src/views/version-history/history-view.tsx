@@ -19,8 +19,6 @@ function computeSimpleDiff(oldText: string, newText: string): DiffLine[] {
   const newLines = newText.split("\n");
   const result: DiffLine[] = [];
 
-  // Simple LCS-based diff for display purposes
-  const maxLen = Math.max(oldLines.length, newLines.length);
   let oi = 0, ni = 0;
   let lineNum = 1;
 
