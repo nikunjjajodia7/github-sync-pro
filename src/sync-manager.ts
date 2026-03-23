@@ -781,6 +781,27 @@ export default class SyncManager {
         {},
       );
 
+    // Orphan sweep: find files in the remote tree that should NOT be there.
+    // These are files uploaded before scope filtering was tightened (e.g., .ts
+    // files uploaded when mode was "broad") that are now invisible to the sync
+    // system. Since base_tree preserves all files, they persist forever unless
+    // we explicitly remove them with sha=null.
+    for (const filePath of Object.keys(files)) {
+      if (this.shouldSkipSyncPath(filePath)) {
+        // File is in remote tree but NOT trackable — it's an orphan
+        if (!actions.find((a) => a.filePath === filePath)) {
+          newTreeFiles[filePath] = {
+            path: filePath,
+            mode: "100644",
+            type: "blob",
+            sha: null,
+          };
+          metadataChanged = true;
+          await this.logger.info("Orphan sweep: removing untrackable file from remote", filePath);
+        }
+      }
+    }
+
     if (actions.length === 0) {
       if (metadataChanged) {
         await this.logger.info(
@@ -1409,11 +1430,15 @@ export default class SyncManager {
         }),
     );
 
-    // Clean deleted entries from metadata before uploading manifest.
-    // Once a delete has been synced, the entry serves no purpose and
-    // bloats the manifest (causing stale data on other devices).
+    // Clean old deleted entries from metadata. We keep deleted entries for
+    // at least 24 hours so other devices can see the deletion flag and
+    // perform delete_local. Without this window, the other device would
+    // see the file missing from the manifest and re-upload it.
+    const DELETED_RETENTION_MS = 24 * 60 * 60 * 1000; // 24 hours
+    const now = Date.now();
     for (const filePath of Object.keys(this.metadataStore.data.files)) {
-      if (this.metadataStore.data.files[filePath].deleted) {
+      const entry = this.metadataStore.data.files[filePath];
+      if (entry.deleted && entry.deletedAt && (now - entry.deletedAt) > DELETED_RETENTION_MS) {
         delete this.metadataStore.data.files[filePath];
       }
     }
