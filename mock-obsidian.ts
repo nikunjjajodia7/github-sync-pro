@@ -160,5 +160,17 @@ export function base64ToArrayBuffer(base64: string): ArrayBuffer {
   return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
 }
 
+// Mock Obsidian file types
+export class TAbstractFile {
+  path: string;
+  constructor(path: string) {
+    this.path = path;
+  }
+}
+
+export class TFile extends TAbstractFile {}
+
+export class TFolder extends TAbstractFile {}
+
 // Mock Event reference
 export type EventRef = string;
