@@ -7,6 +7,32 @@ Distribution: BRAT (https://github.com/nikunjjajodia7/github-sync-pro)
 GitHub App: "Sync Pro for Obsidian" — Client ID: Iv23liwq8PhSpVtHGahx
 GitHub App Org: (registered under dedicated org for bus-factor protection)
 
+## Session Management
+
+**Start a NEW session when:**
+- Switching to a different feature ("OAuth done, now version history")
+- After a release is shipped
+- After a revert (old context has stale file contents)
+- Context feels heavy (going back and forth, mistakes or repetition)
+- Switching from design to implementation (/office-hours → new session → implement)
+
+**Stay in the SAME session when:**
+- Working on one feature end-to-end (design → implement → review → ship)
+- Debugging a specific bug (/investigate → fix → verify)
+- Iterating on review feedback (/review → fix issues → re-review)
+- Quick follow-ups on the same topic
+
+**Each feature from the re-add list should be its own session:**
+```
+Session 1: /office-hours → design OAuth onboarding
+Session 2: Implement OAuth (branch, TDD, /review, /ship)
+Session 3: /office-hours → design version history
+Session 4: Implement version history
+...
+```
+
+Rule: if you're about to say "now let's do something completely different" — start a new session.
+
 ## Development Workflow — Use gstack Skills
 
 This project uses gstack skills for the entire development lifecycle.
