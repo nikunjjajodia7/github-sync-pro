@@ -66,43 +66,44 @@ describe("determineSyncActions", () => {
       expect(actions).toHaveLength(0);
     });
 
-    it("returns upload when remote deleted but local exists (edit always wins)", async () => {
-      mockCalculateSHA({ "note.md": "abc123" });
+    it("returns upload when remote deleted and local was actually edited", async () => {
+      // Local SHA differs from stored SHA = local was edited
+      mockCalculateSHA({ "note.md": "new_local_sha" });
       const actions = await callDetermineSyncActions(
         { "note.md": makeFileMetadata("note.md", { deleted: true, deletedAt: 2000 }) },
-        { "note.md": makeFileMetadata("note.md", { lastModified: 1000 }) },
-      );
-      // Edit always wins — local file has content, re-upload it
-      expect(actions).toContainEqual({ type: "upload", filePath: "note.md" });
-    });
-
-    it("returns upload regardless of timestamp when remote deleted (edit wins)", async () => {
-      mockCalculateSHA({ "note.md": "abc123" });
-      const actions = await callDetermineSyncActions(
-        { "note.md": makeFileMetadata("note.md", { deleted: true, deletedAt: 1000 }) },
-        { "note.md": makeFileMetadata("note.md", { lastModified: 2000 }) },
+        { "note.md": makeFileMetadata("note.md", { sha: "old_sha", lastModified: 1000 }) },
       );
       expect(actions).toContainEqual({ type: "upload", filePath: "note.md" });
     });
 
-    it("returns download when local deleted but remote has edits (edit wins)", async () => {
+    it("returns delete_local when remote deleted and local was NOT edited", async () => {
+      // Local SHA matches stored SHA = local unchanged, propagate delete
+      mockCalculateSHA({ "note.md": "same_sha" });
+      const actions = await callDetermineSyncActions(
+        { "note.md": makeFileMetadata("note.md", { deleted: true, deletedAt: 2000 }) },
+        { "note.md": makeFileMetadata("note.md", { sha: "same_sha", lastModified: 1000 }) },
+      );
+      expect(actions).toContainEqual({ type: "delete_local", filePath: "note.md" });
+    });
+
+    it("returns download when local deleted and remote was actually edited", async () => {
+      // Remote SHA differs from stored SHA = remote was edited by another device
       mockCalculateSHA({ "note.md": "abc123" });
       const actions = await callDetermineSyncActions(
-        { "note.md": makeFileMetadata("note.md", { lastModified: 2000 }) },
-        { "note.md": makeFileMetadata("note.md", { deleted: true, deletedAt: 1000 }) },
+        { "note.md": makeFileMetadata("note.md", { sha: "new_remote_sha", lastModified: 2000 }) },
+        { "note.md": makeFileMetadata("note.md", { sha: "old_sha", deleted: true, deletedAt: 1000 }) },
       );
-      // Edit always wins — remote has content, download it
       expect(actions).toContainEqual({ type: "download", filePath: "note.md" });
     });
 
-    it("returns download regardless of timestamp when local deleted (edit wins)", async () => {
+    it("returns delete_remote when local deleted and remote was NOT edited", async () => {
+      // Remote SHA matches stored SHA = remote unchanged, propagate delete
       mockCalculateSHA({ "note.md": "abc123" });
       const actions = await callDetermineSyncActions(
-        { "note.md": makeFileMetadata("note.md", { lastModified: 1000 }) },
-        { "note.md": makeFileMetadata("note.md", { deleted: true, deletedAt: 2000 }) },
+        { "note.md": makeFileMetadata("note.md", { sha: "same_sha", lastModified: 1000 }) },
+        { "note.md": makeFileMetadata("note.md", { sha: "same_sha", deleted: true, deletedAt: 2000 }) },
       );
-      // Edit always wins — remote has content, download it even though local delete is newer
-      expect(actions).toContainEqual({ type: "download", filePath: "note.md" });
+      expect(actions).toContainEqual({ type: "delete_remote", filePath: "note.md" });
     });
 
     it("skips when SHAs match (file unchanged)", async () => {

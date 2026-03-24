@@ -418,6 +418,7 @@ export default class SyncManager {
    * @returns
    */
   async sync() {
+    console.error("[SYNC-DEBUG] SyncManager.sync() entered, syncing=" + this.syncing);
     if (this.syncing) {
       this.logger.info("Sync already in progress");
       // We're already syncing, nothing to do
@@ -426,6 +427,7 @@ export default class SyncManager {
 
     const notice = new Notice("Syncing...");
     this.syncing = true;
+    console.error("[SYNC-DEBUG] starting syncImpl");
 
     // Pause event listener during sync to prevent race conditions
     // between programmatic file writes and user edits.
@@ -450,6 +452,7 @@ export default class SyncManager {
         }
       }
     } catch (err) {
+      console.error("[SYNC-DEBUG] sync error caught:", err);
       if (err instanceof StaleStateError) {
         new Notice(
           "Sync failed — another device is syncing simultaneously. Try again in a moment.",
@@ -649,19 +652,33 @@ export default class SyncManager {
       ...conflictActions,
     ];
 
-    // Add remote files not present in either metadata store.
-    Object.keys(files).forEach((filePath: string) => {
-      if (this.shouldSkipSyncPath(filePath)) {
-        return;
-      }
-      if (
-        !remoteMetadata.files[filePath] &&
-        !this.metadataStore.data.files[filePath] &&
-        !actions.find((action) => action.filePath === filePath)
-      ) {
-        actions.push({ type: "download", filePath });
-      }
-    });
+    // Handle remote files not present in either metadata store.
+    // If the file also doesn't exist locally, it's an orphan from a deleted
+    // folder — remove it from remote. Otherwise, download it.
+    await Promise.all(
+      Object.keys(files).map(async (filePath: string) => {
+        if (this.shouldSkipSyncPath(filePath)) {
+          return;
+        }
+        if (
+          !remoteMetadata.files[filePath] &&
+          !this.metadataStore.data.files[filePath] &&
+          !actions.find((action) => action.filePath === filePath)
+        ) {
+          const existsLocally = await this.vault.adapter.exists(
+            normalizePath(filePath),
+          );
+          if (existsLocally) {
+            actions.push({ type: "download", filePath });
+          } else {
+            // Orphan file on remote — not tracked, not on local disk.
+            // Delete it from remote to keep the repo clean.
+            actions.push({ type: "delete_remote", filePath });
+            await this.logger.info("Cleaning up orphan remote file", filePath);
+          }
+        }
+      }),
+    );
 
     const newTreeFiles: { [key: string]: NewTreeRequestItem } = Object.keys(
       files,
@@ -699,6 +716,14 @@ export default class SyncManager {
         switch (action.type) {
           case "upload": {
             const normalizedPath = normalizePath(action.filePath);
+            // Skip files that no longer exist on disk (ghost metadata entries)
+            if (!(await this.vault.adapter.exists(normalizedPath))) {
+              await this.logger.warn(
+                "Skipping upload for missing file",
+                action.filePath,
+              );
+              break;
+            }
             const resolution = conflictResolutions.find(
               (c: ConflictResolution) => c.filePath === action.filePath,
             );
@@ -985,23 +1010,35 @@ export default class SyncManager {
         const localSHA = await this.calculateSHA(filePath);
 
         if (remoteFile.deleted && !localFile.deleted) {
-          // Edit always wins over delete — the local file has edits,
-          // so re-upload it even though the remote side deleted it.
-          // This prevents silent data loss from cross-device deletes.
-          actions.push({ type: "upload", filePath: filePath });
-          new Notice(
-            `'${filePath.split("/").pop()}' was deleted on another device but has local edits. Kept the local version.`,
-          );
+          // Remote deleted this file. Check if local was actually edited
+          // since last sync — if so, the edit wins and we re-upload.
+          // If local is unchanged, propagate the delete normally.
+          const localWasEdited = localSHA !== null && localSHA !== localFile.sha;
+          if (localWasEdited) {
+            actions.push({ type: "upload", filePath: filePath });
+            new Notice(
+              `'${filePath.split("/").pop()}' was deleted on another device but has local edits. Kept the local version.`,
+            );
+          } else {
+            actions.push({ type: "delete_local", filePath: filePath });
+          }
           return;
         }
 
         if (!remoteFile.deleted && localFile.deleted) {
-          // Remote has edits but local deleted — download the remote
-          // version to preserve the edits from the other device.
-          actions.push({ type: "download", filePath: filePath });
-          new Notice(
-            `'${filePath.split("/").pop()}' was deleted locally but has remote edits. Restored the remote version.`,
-          );
+          // Local deleted this file. Check if remote was actually edited
+          // since last sync — if so, the edit wins and we download.
+          // If remote is unchanged, propagate the delete normally.
+          const remoteWasEdited =
+            localFile.sha !== null && remoteFile.sha !== localFile.sha;
+          if (remoteWasEdited) {
+            actions.push({ type: "download", filePath: filePath });
+            new Notice(
+              `'${filePath.split("/").pop()}' was deleted locally but has remote edits. Restored the remote version.`,
+            );
+          } else {
+            actions.push({ type: "delete_remote", filePath: filePath });
+          }
           return;
         }
 
