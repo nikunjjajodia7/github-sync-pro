@@ -180,7 +180,7 @@ describe("findConflicts", () => {
     expect(conflicts).toHaveLength(0);
   });
 
-  it("throws on binary conflict in ask mode", async () => {
+  it("auto-resolves binary conflict in ask mode (no throw)", async () => {
     const baseSha = "base_sha";
     setLocalMetadata({
       "image.png": makeFileMetadata("image.png", { sha: baseSha }),
@@ -189,10 +189,14 @@ describe("findConflicts", () => {
 
     vault._store["image.png"] = "fake binary";
 
-    await expect(
-      syncManager.findConflicts({
-        "image.png": makeFileMetadata("image.png", { sha: "remote_new_sha" }),
-      }),
-    ).rejects.toThrow("Binary conflict detected");
+    // Binary conflicts in ask mode no longer throw — they return as
+    // conflicts with empty content, to be auto-resolved as downloads
+    const conflicts = await syncManager.findConflicts({
+      "image.png": makeFileMetadata("image.png", { sha: "remote_new_sha" }),
+    });
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0].filePath).toBe("image.png");
+    expect(conflicts[0].remoteContent).toBe("");
+    expect(conflicts[0].localContent).toBe("");
   });
 });

@@ -97,3 +97,17 @@ export async function retryUntil<T>(
     delay *= backoffFactor;
   }
 }
+
+/**
+ * Thrown when the remote branch HEAD moved during sync,
+ * indicating another device pushed a commit while we were syncing.
+ * The sync should be retried from scratch.
+ */
+export class StaleStateError extends Error {
+  constructor(expectedSha: string, actualSha: string) {
+    super(
+      `Remote branch moved during sync (expected ${expectedSha.slice(0, 8)}, got ${actualSha.slice(0, 8)}). Will retry.`,
+    );
+    this.name = "StaleStateError";
+  }
+}

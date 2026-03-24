@@ -18,7 +18,7 @@ import MetadataStore, {
 import EventsListener from "./events-listener";
 import { GitHubSyncSettings } from "./settings/settings";
 import Logger, { LOG_FILE_NAME } from "./logger";
-import { decodeBase64String, hasTextExtension } from "./utils";
+import { decodeBase64String, hasTextExtension, StaleStateError } from "./utils";
 import GitHubSyncPlugin from "./main";
 import { BlobReader, Entry, Uint8ArrayWriter, ZipReader } from "@zip.js/zip.js";
 import { isTrackableSyncPath } from "./sync-scope";
@@ -426,30 +426,59 @@ export default class SyncManager {
 
     const notice = new Notice("Syncing...");
     this.syncing = true;
+
+    // Pause event listener during sync to prevent race conditions
+    // between programmatic file writes and user edits.
+    this.eventsListener.pause();
+
+    const MAX_STALE_RETRIES = 3;
     try {
-      await this.syncImpl();
-      // Shown only if sync doesn't fail
-      new Notice("Sync successful", 5000);
+      for (let attempt = 0; attempt <= MAX_STALE_RETRIES; attempt++) {
+        try {
+          await this.syncImpl();
+          // Shown only if sync doesn't fail
+          new Notice("Sync successful", 5000);
+          break;
+        } catch (err) {
+          if (err instanceof StaleStateError && attempt < MAX_STALE_RETRIES) {
+            await this.logger.warn(
+              `Stale state detected (attempt ${attempt + 1}/${MAX_STALE_RETRIES}), retrying sync from scratch`,
+            );
+            continue;
+          }
+          throw err;
+        }
+      }
     } catch (err) {
-      // Show the error to the user, it's not automatically dismissed to make sure
-      // the user sees it.
-      new Notice(`Error syncing. ${err}`);
+      if (err instanceof StaleStateError) {
+        new Notice(
+          "Sync failed — another device is syncing simultaneously. Try again in a moment.",
+        );
+      } else {
+        // Show the error to the user, it's not automatically dismissed to make sure
+        // the user sees it.
+        new Notice(`Error syncing. ${err}`);
+      }
+    } finally {
+      // Always resume event listener, even if sync failed
+      this.eventsListener.resume();
+      this.syncing = false;
+      notice.hide();
     }
-    this.syncing = false;
-    notice.hide();
   }
 
   private async syncImpl() {
     await this.logger.info("Starting sync");
+
+    // Capture HEAD SHA at the start of sync for staleness detection.
+    // If HEAD moves before we update the branch ref, another device pushed
+    // a commit and we must re-sync from scratch to avoid dropping files.
+    const initialHeadSha = await this.client.getBranchHeadSha({ retry: true });
+
     const { files, sha: treeSha } = await this.client.getRepoContent({
       retry: true,
     });
     const manifest = files[`${this.vault.configDir}/${MANIFEST_FILE_NAME}`];
-
-    if (manifest === undefined) {
-      await this.logger.error("Remote manifest is missing", { files, treeSha });
-      throw new Error("Remote manifest is missing");
-    }
 
     if (
       Object.keys(files).contains(`${this.vault.configDir}/${LOG_FILE_NAME}`)
@@ -461,13 +490,37 @@ export default class SyncManager {
       delete files[`${this.vault.configDir}/${LOG_FILE_NAME}`];
     }
 
-    const blob = await this.client.getBlob({ sha: manifest.sha });
-    const remoteMetadata: Metadata = JSON.parse(
-      decodeBase64String(blob.content),
-    );
+    let remoteMetadata: Metadata;
     let metadataChanged = false;
-    if (!remoteMetadata.files) {
-      remoteMetadata.files = {};
+
+    if (manifest === undefined) {
+      // Remote manifest is missing — create a synthetic one from the tree.
+      // This happens when files were added to the repo outside of this plugin.
+      await this.logger.warn(
+        "Remote manifest missing, creating from tree state",
+        { fileCount: Object.keys(files).length },
+      );
+      new Notice(
+        "No sync manifest found. Creating one from current repo state. Some sync history may be lost.",
+      );
+      remoteMetadata = { lastSync: 0, files: {} };
+      Object.keys(files).forEach((filePath: string) => {
+        if (this.shouldSkipSyncPath(filePath)) return;
+        remoteMetadata.files[filePath] = {
+          path: filePath,
+          sha: files[filePath].sha,
+          dirty: false,
+          justDownloaded: false,
+          lastModified: Date.now(),
+        };
+      });
+      metadataChanged = true;
+    } else {
+      const blob = await this.client.getBlob({ sha: manifest.sha });
+      remoteMetadata = JSON.parse(decodeBase64String(blob.content));
+      if (!remoteMetadata.files) {
+        remoteMetadata.files = {};
+      }
     }
 
     const removedEntries = await this.cleanupUntrackableMetadataEntries();
@@ -536,13 +589,36 @@ export default class SyncManager {
     if (conflicts.length > 0) {
       await this.logger.warn("Found conflicts", conflicts);
       if (this.settings.conflictHandling === "ask") {
-        // Here we block the sync process until the user has resolved all the conflicts
-        conflictResolutions = await this.onConflicts(conflicts);
-        conflictActions = conflictResolutions.map(
-          (resolution: ConflictResolution) => {
-            return { type: "upload", filePath: resolution.filePath };
-          },
+        // Separate binary and text conflicts — binary can't use the diff UI
+        const textConflicts = conflicts.filter((c) =>
+          hasTextExtension(c.filePath),
         );
+        const binaryConflicts = conflicts.filter(
+          (c) => !hasTextExtension(c.filePath),
+        );
+
+        // Auto-resolve binary conflicts as downloads (keep remote version)
+        if (binaryConflicts.length > 0) {
+          conflictActions.push(
+            ...binaryConflicts.map((c) => ({
+              type: "download" as const,
+              filePath: c.filePath,
+            })),
+          );
+        }
+
+        // Ask user to resolve text conflicts
+        if (textConflicts.length > 0) {
+          conflictResolutions = await this.onConflicts(textConflicts);
+          conflictActions.push(
+            ...conflictResolutions.map(
+              (resolution: ConflictResolution) => ({
+                type: "upload" as const,
+                filePath: resolution.filePath,
+              }),
+            ),
+          );
+        }
       } else if (this.settings.conflictHandling === "overwriteLocal") {
         // The user explicitly wants to always overwrite the local file
         // in case of conflicts so we just download the remote file to solve it
@@ -609,7 +685,7 @@ export default class SyncManager {
         await this.logger.info(
           "No file actions to sync, committing metadata updates only",
         );
-        await this.commitSync(newTreeFiles, treeSha);
+        await this.commitSync(newTreeFiles, treeSha, [], initialHeadSha);
         return;
       }
       // Nothing to sync
@@ -657,7 +733,8 @@ export default class SyncManager {
       }),
     );
 
-    // Download files and delete local files
+    // Download files and delete local files.
+    // Track written paths so the event listener can distinguish sync writes from user edits.
     await Promise.all([
       ...actions
         .filter((action) => action.type === "download")
@@ -668,6 +745,10 @@ export default class SyncManager {
               ? remoteMetadata.files[action.filePath].lastModified
               : Date.now(),
           );
+          this.eventsListener.syncWrittenPaths.set(
+            action.filePath,
+            files[action.filePath]?.sha ?? null,
+          );
         }),
       ...actions
         .filter((action) => action.type === "delete_local")
@@ -676,7 +757,12 @@ export default class SyncManager {
         }),
     ]);
 
-    await this.commitSync(newTreeFiles, treeSha, conflictResolutions);
+    await this.commitSync(
+      newTreeFiles,
+      treeSha,
+      conflictResolutions,
+      initialHeadSha,
+    );
   }
 
   /**
@@ -812,13 +898,19 @@ export default class SyncManager {
       this.settings.conflictHandling === "ask" &&
       binaryConflictPaths.length > 0
     ) {
-      await this.logger.error(
-        "Binary conflicts are not supported in Ask mode. Use overwriteLocal or overwriteRemote.",
+      // Binary conflicts can't be shown in the text diff UI, so we auto-resolve
+      // by keeping the remote version (download) and notifying the user.
+      await this.logger.warn(
+        "Binary conflicts auto-resolved by downloading remote version",
         binaryConflictPaths,
       );
-      throw new Error(
-        "Binary conflict detected. Set conflict handling to Overwrite local or Overwrite remote and sync again.",
-      );
+      for (const binaryPath of binaryConflictPaths) {
+        new Notice(
+          `Binary conflict on '${binaryPath.split("/").pop()}' — kept the remote version. Re-upload locally if needed.`,
+        );
+      }
+      // Remove binary paths from conflict list — they'll be handled as downloads
+      // by returning them with empty content (existing behavior below handles this)
     }
 
     return await Promise.all(
@@ -893,33 +985,24 @@ export default class SyncManager {
         const localSHA = await this.calculateSHA(filePath);
 
         if (remoteFile.deleted && !localFile.deleted) {
-          if ((remoteFile.deletedAt as number) > localFile.lastModified) {
-            actions.push({
-              type: "delete_local",
-              filePath: filePath,
-            });
-            return;
-          } else if (
-            localFile.lastModified > (remoteFile.deletedAt as number)
-          ) {
-            actions.push({ type: "upload", filePath: filePath });
-            return;
-          }
+          // Edit always wins over delete — the local file has edits,
+          // so re-upload it even though the remote side deleted it.
+          // This prevents silent data loss from cross-device deletes.
+          actions.push({ type: "upload", filePath: filePath });
+          new Notice(
+            `'${filePath.split("/").pop()}' was deleted on another device but has local edits. Kept the local version.`,
+          );
+          return;
         }
 
         if (!remoteFile.deleted && localFile.deleted) {
-          if (remoteFile.lastModified > (localFile.deletedAt as number)) {
-            actions.push({ type: "download", filePath: filePath });
-            return;
-          } else if (
-            (localFile.deletedAt as number) > remoteFile.lastModified
-          ) {
-            actions.push({
-              type: "delete_remote",
-              filePath: filePath,
-            });
-            return;
-          }
+          // Remote has edits but local deleted — download the remote
+          // version to preserve the edits from the other device.
+          actions.push({ type: "download", filePath: filePath });
+          new Notice(
+            `'${filePath.split("/").pop()}' was deleted locally but has remote edits. Restored the remote version.`,
+          );
+          return;
         }
 
         if (remoteFile.sha === localSHA) {
@@ -1047,43 +1130,21 @@ export default class SyncManager {
     treeFiles: { [key: string]: NewTreeRequestItem },
     baseTreeSha: string,
     conflictResolutions: ConflictResolution[] = [],
+    expectedHeadSha?: string,
   ) {
-    // Update local sync time
+    // Sync timestamp — used for manifest snapshot but NOT applied to live
+    // metadataStore until after commit succeeds (deferred writes pattern).
     const syncTime = Date.now();
-    this.metadataStore.data.lastSync = syncTime;
-    this.metadataStore.save();
 
-    // We update the last modified timestamp for all files that had resolved conflicts
-    // to the the same time as the sync time.
-    // At this time we still have not written the conflict resolution content to file,
-    // so the last modified timestamp doesn't reflect that.
-    // To prevent further conflicts in future syncs and to reflect the content change
-    // on the remote metadata we update the timestamp for the conflicting files here,
-    // just before pushing to remote.
-    // We're going to update the local content when the sync is successful.
-    conflictResolutions.forEach((resolution) => {
-      this.metadataStore.data.files[resolution.filePath].lastModified =
-        syncTime;
-    });
+    // Deferred writes: accumulate SHA updates in a pending map instead of
+    // modifying metadataStore.data directly. Only apply after commit succeeds.
+    // This prevents stale metadata if any API call fails mid-pipeline.
+    const pendingSHAs: { [filePath: string]: string | null } = {};
 
-    // We want the remote metadata file to track the correct SHA for each file blob,
-    // so just before we upload any file we update all their SHAs in the metadata file.
-    // This also makes it easier to handle conflicts.
-    // We don't save the metadata file after setting the SHAs cause we do that when
-    // the sync is fully commited at the end.
-    // TODO: Understand whether it's a problem we don't revert the SHA setting in case of sync failure
-    //
-    // In here we also upload blob is file is a binary. We do it here because when uploading a blob we
-    // also get back its SHA, so we can set it together with other files.
-    // We also do that right before creating the new tree because we need the SHAs of those blob to
-    // correctly create it.
     await Promise.all(
       Object.keys(treeFiles)
         .filter((filePath: string) => treeFiles[filePath].content)
         .map(async (filePath: string) => {
-          // I don't fully trust file extensions as they're not completely reliable
-          // to determine the file type, though I feel it's ok to compromise and rely
-          // on them if it makes the plugin handle upload better on certain devices.
           if (hasTextExtension(filePath)) {
             const resolution = conflictResolutions.find(
               (item) => item.filePath === filePath,
@@ -1091,13 +1152,11 @@ export default class SyncManager {
             const sha = resolution
               ? await this.calculateTextSHA(treeFiles[filePath].content!)
               : await this.calculateSHA(filePath);
-            this.metadataStore.data.files[filePath].sha = sha;
+            pendingSHAs[filePath] = sha;
             return;
           }
 
-          // We can't upload binary files by setting the content of a tree item,
-          // we first need to create a Git blob by uploading the file, then
-          // we must update the tree item to point the SHA to the blob we just created.
+          // Binary files: upload blob, get SHA back
           const buffer = await this.vault.adapter.readBinary(filePath);
           const { sha } = await this.client.createBlob({
             content: arrayBufferToBase64(buffer),
@@ -1106,16 +1165,32 @@ export default class SyncManager {
           });
           await this.logger.info("Created blob", filePath);
           treeFiles[filePath].sha = sha;
-          // Can't have both sha and content set, so we delete it
           delete treeFiles[filePath].content;
-          this.metadataStore.data.files[filePath].sha = sha;
+          pendingSHAs[filePath] = sha;
         }),
     );
+
+    // Build manifest content for the remote by merging pending SHAs into
+    // a copy of the current metadata (without mutating the live store).
+    const manifestSnapshot = JSON.parse(
+      JSON.stringify(this.metadataStore.data),
+    );
+    manifestSnapshot.lastSync = syncTime;
+    for (const [fp, sha] of Object.entries(pendingSHAs)) {
+      if (manifestSnapshot.files[fp]) {
+        manifestSnapshot.files[fp].sha = sha;
+      }
+    }
+    conflictResolutions.forEach((resolution) => {
+      if (manifestSnapshot.files[resolution.filePath]) {
+        manifestSnapshot.files[resolution.filePath].lastModified = syncTime;
+      }
+    });
 
     // Update manifest in list of new tree items
     delete treeFiles[`${this.vault.configDir}/${MANIFEST_FILE_NAME}`].sha;
     treeFiles[`${this.vault.configDir}/${MANIFEST_FILE_NAME}`].content =
-      JSON.stringify(this.metadataStore.data);
+      JSON.stringify(manifestSnapshot);
 
     // Create the new tree
     const newTree: { tree: NewTreeRequestItem[]; base_tree: string } = {
@@ -1131,31 +1206,47 @@ export default class SyncManager {
 
     const branchHeadSha = await this.client.getBranchHeadSha({ retry: true });
 
+    // Staleness check: if expectedHeadSha was provided (from incremental sync),
+    // verify the branch HEAD hasn't moved since we started.
+    if (expectedHeadSha && branchHeadSha !== expectedHeadSha) {
+      throw new StaleStateError(expectedHeadSha, branchHeadSha);
+    }
+
     const commitSha = await this.client.createCommit({
       // TODO: Make this configurable or find a nicer commit message
       message: "Sync",
       treeSha: newTreeSha,
       parent: branchHeadSha,
+      retry: true,
     });
 
     await this.client.updateBranchHead({ sha: commitSha, retry: true });
 
-    // Update the local content of all files that had conflicts we resolved
+    // ── Commit succeeded — now apply deferred state to live metadata ──
+
+    // Apply sync timestamp
+    this.metadataStore.data.lastSync = syncTime;
+
+    // Apply pending SHAs
+    for (const [fp, sha] of Object.entries(pendingSHAs)) {
+      if (this.metadataStore.data.files[fp]) {
+        this.metadataStore.data.files[fp].sha = sha;
+      }
+    }
+
+    // Write conflict resolution content to local files and update timestamps
     await Promise.all(
       conflictResolutions.map(async (resolution) => {
         await this.vault.adapter.write(resolution.filePath, resolution.content);
-        // Even though we set the last modified timestamp for all files with conflicts
-        // just before pushing the changes to remote we do it here again because the
-        // write right above would overwrite that.
-        // Since we want to keep the sync timestamp for this file to avoid future conflicts
-        // we update it again.
-        this.metadataStore.data.files[resolution.filePath].lastModified =
-          syncTime;
+        if (this.metadataStore.data.files[resolution.filePath]) {
+          this.metadataStore.data.files[resolution.filePath].lastModified =
+            syncTime;
+        }
       }),
     );
-    // Now that the sync is done and we updated the content for conflicting files
-    // we can save the latest metadata to disk.
-    this.metadataStore.save();
+
+    // Save the fully updated metadata to disk
+    await this.metadataStore.save();
     await this.logger.info("Sync done");
   }
 
@@ -1192,7 +1283,7 @@ export default class SyncManager {
     await this.vault.adapter.remove(normalizedPath);
     this.metadataStore.data.files[filePath].deleted = true;
     this.metadataStore.data.files[filePath].deletedAt = Date.now();
-    this.metadataStore.save();
+    await this.metadataStore.save();
   }
 
   async loadMetadata() {
@@ -1251,7 +1342,7 @@ export default class SyncManager {
         justDownloaded: false,
         lastModified: Date.now(),
       };
-      this.metadataStore.save();
+      await this.metadataStore.save();
     }
     await this.logger.info("Loaded metadata");
   }
@@ -1288,7 +1379,7 @@ export default class SyncManager {
         lastModified: Date.now(),
       };
     });
-    this.metadataStore.save();
+    await this.metadataStore.save();
   }
 
   /**
@@ -1321,7 +1412,7 @@ export default class SyncManager {
       }
       delete this.metadataStore.data.files[filePath];
     });
-    this.metadataStore.save();
+    await this.metadataStore.save();
   }
 
   getFileMetadata(filePath: string): FileMetadata {

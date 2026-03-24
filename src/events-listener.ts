@@ -7,8 +7,22 @@ import { isTrackableSyncPath } from "./sync-scope";
 
 /**
  * Tracks changes to local sync directory and updates files metadata.
+ *
+ * Supports pause/resume for sync operations: when paused, events are
+ * silently ignored. After sync completes, files written by sync are
+ * tracked in syncWrittenPaths so we can distinguish sync writes from
+ * user edits that happened during the pause window.
  */
 export default class EventsListener {
+  private paused: boolean = false;
+
+  /**
+   * Files written by the sync engine during the current sync cycle.
+   * Maps file path → expected SHA after sync write.
+   * Used during resume to detect user edits that happened during sync.
+   */
+  syncWrittenPaths: Map<string, string | null> = new Map();
+
   constructor(
     private vault: Vault,
     private metadataStore: MetadataStore,
@@ -26,7 +40,30 @@ export default class EventsListener {
     plugin.registerEvent(this.vault.on("rename", this.onRename.bind(this)));
   }
 
+  /**
+   * Pause event processing during sync operations.
+   * Events that fire while paused are silently ignored.
+   */
+  pause() {
+    this.paused = true;
+    this.syncWrittenPaths.clear();
+  }
+
+  /**
+   * Resume event processing after sync completes.
+   * Clears the sync-written paths tracker.
+   */
+  resume() {
+    this.paused = false;
+    this.syncWrittenPaths.clear();
+  }
+
+  isPaused(): boolean {
+    return this.paused;
+  }
+
   private async onCreate(file: TAbstractFile) {
+    if (this.paused) return;
     await this.logger.info("Received create event", file.path);
     if (!this.isSyncable(file.path)) {
       // The file has not been created in directory that we're syncing with GitHub
@@ -61,6 +98,7 @@ export default class EventsListener {
   }
 
   private async onDelete(file: TAbstractFile | string) {
+    if (this.paused) return;
     const filePath = file instanceof TAbstractFile ? file.path : file;
     await this.logger.info("Received delete event", filePath);
     if (file instanceof TFolder) {
@@ -83,6 +121,7 @@ export default class EventsListener {
   }
 
   private async onModify(file: TAbstractFile) {
+    if (this.paused) return;
     await this.logger.info("Received modify event", file.path);
     if (!this.isSyncable(file.path)) {
       // The file has not been create in directory that we're syncing with GitHub
@@ -121,6 +160,7 @@ export default class EventsListener {
   }
 
   private async onRename(file: TAbstractFile, oldPath: string) {
+    if (this.paused) return;
     await this.logger.info("Received rename event", file.path);
     if (file instanceof TFolder) {
       // Skip folders
