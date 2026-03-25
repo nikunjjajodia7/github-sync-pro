@@ -694,16 +694,46 @@ export default class SyncManager {
         {},
       );
 
+    // Process deletedFolders from remote manifest BEFORE the early-return
+    // check. The receiving device (e.g. mobile) may have no file actions but
+    // still needs to remove folders that were deleted on the sending device.
+    const hasRemoteDeletedFolders =
+      remoteMetadata.deletedFolders &&
+      remoteMetadata.deletedFolders.length > 0;
+
+    if (hasRemoteDeletedFolders) {
+      await this.logger.info(
+        "Processing remote deletedFolders",
+        remoteMetadata.deletedFolders,
+      );
+      if (!this.metadataStore.data.deletedFolders) {
+        this.metadataStore.data.deletedFolders = [];
+      }
+      for (const folderPath of remoteMetadata.deletedFolders!) {
+        if (!this.metadataStore.data.deletedFolders.contains(folderPath)) {
+          this.metadataStore.data.deletedFolders.push(folderPath);
+        }
+      }
+
+      // Remove empty folders locally
+      for (const folderPath of remoteMetadata.deletedFolders!) {
+        const normalizedDir = normalizePath(folderPath);
+        if (await this.vault.adapter.exists(normalizedDir)) {
+          await this.removeDirectoryRecursive(normalizedDir);
+        }
+      }
+    }
+
     // Check if local manifest has pending deletedFolders to push
     const hasDeletedFolders =
       this.metadataStore.data.deletedFolders &&
       this.metadataStore.data.deletedFolders.length > 0;
 
     if (actions.length === 0) {
-      if (metadataChanged || hasDeletedFolders) {
+      if (metadataChanged || hasDeletedFolders || hasRemoteDeletedFolders) {
         await this.logger.info(
           "No file actions to sync, committing metadata updates only",
-          { metadataChanged, hasDeletedFolders },
+          { metadataChanged, hasDeletedFolders, hasRemoteDeletedFolders },
         );
         await this.commitSync(newTreeFiles, treeSha, [], initialHeadSha);
         return;
@@ -785,31 +815,9 @@ export default class SyncManager {
         }),
     ]);
 
-    // Merge remote deletedFolders into local so they persist across syncs.
-    // This ensures all devices eventually see the full list.
-    if (remoteMetadata.deletedFolders && remoteMetadata.deletedFolders.length > 0) {
-      if (!this.metadataStore.data.deletedFolders) {
-        this.metadataStore.data.deletedFolders = [];
-      }
-      for (const folderPath of remoteMetadata.deletedFolders) {
-        if (!this.metadataStore.data.deletedFolders.contains(folderPath)) {
-          this.metadataStore.data.deletedFolders.push(folderPath);
-        }
-      }
-
-      // Now process: remove empty folders locally
-      for (const folderPath of remoteMetadata.deletedFolders) {
-        const normalizedDir = normalizePath(folderPath);
-        if (await this.vault.adapter.exists(normalizedDir)) {
-          await this.removeDirectoryRecursive(normalizedDir);
-        }
-      }
-    }
-
-    // Clear deletedFolders from local manifest after they've been synced.
-    // They'll be included in the manifest we push to remote, so the other
-    // device will see them on next sync.
-    // After that sync, they can be purged.
+    // deletedFolders were already processed before the early-return check
+    // (above). The merged list is in this.metadataStore.data.deletedFolders
+    // and will be included in the manifest snapshot by commitSync().
 
     await this.commitSync(
       newTreeFiles,
