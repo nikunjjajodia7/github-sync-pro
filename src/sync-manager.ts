@@ -785,11 +785,19 @@ export default class SyncManager {
         }),
     ]);
 
-    // Propagate folder deletions from the remote manifest.
-    // If the other device explicitly deleted a folder, remove it locally.
-    // Files inside should already be deleted (processed above), but empty
-    // subdirectories may remain — remove them bottom-up.
+    // Merge remote deletedFolders into local so they persist across syncs.
+    // This ensures all devices eventually see the full list.
     if (remoteMetadata.deletedFolders && remoteMetadata.deletedFolders.length > 0) {
+      if (!this.metadataStore.data.deletedFolders) {
+        this.metadataStore.data.deletedFolders = [];
+      }
+      for (const folderPath of remoteMetadata.deletedFolders) {
+        if (!this.metadataStore.data.deletedFolders.contains(folderPath)) {
+          this.metadataStore.data.deletedFolders.push(folderPath);
+        }
+      }
+
+      // Now process: remove empty folders locally
       for (const folderPath of remoteMetadata.deletedFolders) {
         const normalizedDir = normalizePath(folderPath);
         if (await this.vault.adapter.exists(normalizedDir)) {
@@ -1303,10 +1311,25 @@ export default class SyncManager {
       }),
     );
 
-    // Clear deletedFolders — they've been pushed to remote manifest,
-    // so the other device will see them on its next sync.
+    // Process deletedFolders from the REMOTE manifest — these are folders
+    // that the other device deleted. Remove them locally if they're empty.
+    // (This runs on the receiving device, not the device that deleted.)
+    // Note: deletedFolders are kept in the manifest until they're old enough
+    // that all devices have had time to process them. We remove entries that
+    // we've already processed (folder no longer exists locally).
     if (this.metadataStore.data.deletedFolders) {
-      this.metadataStore.data.deletedFolders = [];
+      const remaining: string[] = [];
+      for (const folderPath of this.metadataStore.data.deletedFolders) {
+        const normalizedDir = normalizePath(folderPath);
+        const exists = await this.vault.adapter.exists(normalizedDir);
+        if (exists) {
+          // Still exists — keep in the list for the remote manifest so
+          // other devices can process it too
+          remaining.push(folderPath);
+        }
+        // If it doesn't exist, we've already removed it — drop from list
+      }
+      this.metadataStore.data.deletedFolders = remaining;
     }
 
     // Purge stale tombstones: deleted entries whose parent folder no longer
