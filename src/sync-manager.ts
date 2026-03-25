@@ -418,7 +418,6 @@ export default class SyncManager {
    * @returns
    */
   async sync() {
-    console.error("[SYNC-DEBUG] SyncManager.sync() entered, syncing=" + this.syncing);
     if (this.syncing) {
       this.logger.info("Sync already in progress");
       // We're already syncing, nothing to do
@@ -427,7 +426,6 @@ export default class SyncManager {
 
     const notice = new Notice("Syncing...");
     this.syncing = true;
-    console.error("[SYNC-DEBUG] starting syncImpl");
 
     // Pause event listener during sync to prevent race conditions
     // between programmatic file writes and user edits.
@@ -452,7 +450,6 @@ export default class SyncManager {
         }
       }
     } catch (err) {
-      console.error("[SYNC-DEBUG] sync error caught:", err);
       if (err instanceof StaleStateError) {
         new Notice(
           "Sync failed — another device is syncing simultaneously. Try again in a moment.",

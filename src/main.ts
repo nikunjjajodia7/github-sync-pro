@@ -153,18 +153,15 @@ export default class GitHubSyncPlugin extends Plugin {
   }
 
   async sync() {
-    console.error("[SYNC-DEBUG] sync() called");
     if (
       this.settings.githubToken === "" ||
       this.settings.githubOwner === "" ||
       this.settings.githubRepo === "" ||
       this.settings.githubBranch === ""
     ) {
-      console.error("[SYNC-DEBUG] not configured");
       new Notice("Sync plugin not configured");
       return;
     }
-    console.error("[SYNC-DEBUG] firstSync=" + this.settings.firstSync);
     if (this.settings.firstSync) {
       const notice = new Notice("Syncing...");
       try {

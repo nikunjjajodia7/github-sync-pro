@@ -1,7 +1,7 @@
 {
   "id": "github-gitless-sync-enhanced",
   "name": "GitHub Sync Pro",
-  "version": "1.4.0-beta",
+  "version": "1.5.0",
   "minAppVersion": "1.7.7",
   "description": "Enhanced fork: fixes external file sync, delete propagation, and stability issues for cross-device vault sync.",
   "author": "nikunjjajodia7",
