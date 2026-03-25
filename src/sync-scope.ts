@@ -92,3 +92,31 @@ export function isTrackableSyncPath(
 
   return NOTES_FIRST_EXTENSIONS.has(getExtension(filePath));
 }
+
+type FolderScopeOptions = Pick<GitHubSyncSettings, "syncConfigDir"> & {
+  configDir: string;
+};
+
+export function isTrackableSyncFolderPath(
+  folderPath: string,
+  { configDir, syncConfigDir }: FolderScopeOptions,
+): boolean {
+  if (!folderPath) {
+    return false;
+  }
+  if (
+    folderPath === configDir ||
+    (!syncConfigDir && folderPath.startsWith(`${configDir}/`))
+  ) {
+    return false;
+  }
+  if (
+    folderPath.endsWith(".DS_Store") ||
+    folderPath.endsWith("Thumbs.db") ||
+    folderPath.endsWith(".log")
+  ) {
+    return false;
+  }
+
+  return !hasExcludedSegment(folderPath);
+}

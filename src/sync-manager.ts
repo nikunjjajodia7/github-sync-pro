@@ -21,7 +21,7 @@ import Logger, { LOG_FILE_NAME } from "./logger";
 import { decodeBase64String, hasTextExtension, StaleStateError } from "./utils";
 import GitHubSyncPlugin from "./main";
 import { BlobReader, Entry, Uint8ArrayWriter, ZipReader } from "@zip.js/zip.js";
-import { isTrackableSyncPath } from "./sync-scope";
+import { isTrackableSyncFolderPath, isTrackableSyncPath } from "./sync-scope";
 
 interface SyncAction {
   type: "upload" | "download" | "delete_local" | "delete_remote";
@@ -83,6 +83,58 @@ export default class SyncManager {
 
   private shouldSkipSyncPath(filePath: string): boolean {
     return !this.isTrackablePath(filePath, false);
+  }
+
+  private hasFileLikeExtension(path: string): boolean {
+    const leaf = path.split("/").pop() ?? path;
+    return /\.(md|txt|csv|json|png|jpg|jpeg|webp|gif|svg|pdf|mp3|m4a|wav|webm|mp4)$/i.test(
+      leaf,
+    );
+  }
+
+  private sanitizeDeletedFolders(
+    deletedFolders?: string[],
+    metadataFiles: { [key: string]: FileMetadata } = this.metadataStore.data.files,
+  ): string[] {
+    if (!deletedFolders || deletedFolders.length === 0) {
+      return [];
+    }
+
+    const unique = new Set<string>();
+    const sanitized: string[] = [];
+
+    for (const rawPath of deletedFolders) {
+      const folderPath = normalizePath(rawPath ?? "");
+      if (!folderPath || unique.has(folderPath)) {
+        continue;
+      }
+
+      const hasTrackedChildren = Object.keys(metadataFiles).some(
+        (filePath) => filePath.startsWith(`${folderPath}/`),
+      );
+      const isProbableFilePath =
+        !hasTrackedChildren &&
+        this.hasFileLikeExtension(folderPath);
+
+      if (
+        isProbableFilePath ||
+        !isTrackableSyncFolderPath(folderPath, {
+          configDir: this.vault.configDir,
+          syncConfigDir: this.settings.syncConfigDir,
+        })
+      ) {
+        void this.logger.warn("Dropping invalid deletedFolders entry", {
+          folderPath,
+          reason: isProbableFilePath ? "probable_file_path" : "non_trackable",
+        });
+        continue;
+      }
+
+      unique.add(folderPath);
+      sanitized.push(folderPath);
+    }
+
+    return sanitized;
   }
 
   /**
@@ -697,9 +749,11 @@ export default class SyncManager {
     // Process deletedFolders from remote manifest BEFORE the early-return
     // check. The receiving device (e.g. mobile) may have no file actions but
     // still needs to remove folders that were deleted on the sending device.
-    const hasRemoteDeletedFolders =
-      remoteMetadata.deletedFolders &&
-      remoteMetadata.deletedFolders.length > 0;
+    remoteMetadata.deletedFolders = this.sanitizeDeletedFolders(
+      remoteMetadata.deletedFolders,
+      remoteMetadata.files,
+    );
+    const hasRemoteDeletedFolders = remoteMetadata.deletedFolders.length > 0;
 
     if (hasRemoteDeletedFolders) {
       await this.logger.info(
@@ -719,7 +773,7 @@ export default class SyncManager {
       for (const folderPath of remoteMetadata.deletedFolders!) {
         const normalizedDir = normalizePath(folderPath);
         if (await this.vault.adapter.exists(normalizedDir)) {
-          await this.removeDirectoryRecursive(normalizedDir);
+          await this.removeDirectoryRecursive(normalizedDir, { force: true });
         }
       }
     }
@@ -822,7 +876,7 @@ export default class SyncManager {
       for (const folderPath of remoteMetadata.deletedFolders!) {
         const normalizedDir = normalizePath(folderPath);
         if (await this.vault.adapter.exists(normalizedDir)) {
-          await this.removeDirectoryRecursive(normalizedDir);
+          await this.removeDirectoryRecursive(normalizedDir, { force: true });
         }
       }
     }
@@ -1334,6 +1388,9 @@ export default class SyncManager {
     // that all devices have had time to process them. We remove entries that
     // we've already processed (folder no longer exists locally).
     if (this.metadataStore.data.deletedFolders) {
+      this.metadataStore.data.deletedFolders = this.sanitizeDeletedFolders(
+        this.metadataStore.data.deletedFolders,
+      );
       const remaining: string[] = [];
       for (const folderPath of this.metadataStore.data.deletedFolders) {
         const normalizedDir = normalizePath(folderPath);
@@ -1411,13 +1468,26 @@ export default class SyncManager {
    * exists inside, the directory tree is left intact.
    * Works bottom-up: removes deepest subdirectories first, then parents.
    */
-  private async removeDirectoryRecursive(dirPath: string) {
+  private async removeDirectoryRecursive(
+    dirPath: string,
+    options: { force?: boolean } = {},
+  ) {
     try {
       const { files, folders } = await this.vault.adapter.list(dirPath);
 
+      if (options.force) {
+        for (const filePath of files) {
+          await this.vault.adapter.remove(filePath);
+          await this.logger.info(
+            "Removed leftover file while deleting folder from remote tombstone",
+            filePath,
+          );
+        }
+      }
+
       // First, recursively process subdirectories
       for (const subFolder of folders) {
-        await this.removeDirectoryRecursive(subFolder);
+        await this.removeDirectoryRecursive(subFolder, options);
       }
 
       // Re-check after subdirectory cleanup
@@ -1428,10 +1498,20 @@ export default class SyncManager {
           "Removed folder deleted on another device",
           dirPath,
         );
+      } else if (options.force) {
+        await this.vault.adapter.rmdir(dirPath, true);
+        await this.logger.info(
+          "Force removed folder deleted on another device",
+          dirPath,
+        );
       } else {
         await this.logger.warn(
           "Folder not empty after cleanup, keeping it",
-          { dirPath, files: after.files.length, folders: after.folders.length },
+          {
+            dirPath,
+            files: after.files,
+            folders: after.folders,
+          },
         );
       }
     } catch {
@@ -1443,6 +1523,18 @@ export default class SyncManager {
     await this.logger.info("Loading metadata");
     await this.metadataStore.load();
     let cleaned = false;
+
+    const sanitizedDeletedFolders = this.sanitizeDeletedFolders(
+      this.metadataStore.data.deletedFolders,
+    );
+    if (
+      JSON.stringify(sanitizedDeletedFolders) !==
+      JSON.stringify(this.metadataStore.data.deletedFolders ?? [])
+    ) {
+      this.metadataStore.data.deletedFolders = sanitizedDeletedFolders;
+      cleaned = true;
+    }
+
     Object.keys(this.metadataStore.data.files).forEach((filePath) => {
       if (!this.isTrackablePath(filePath, true)) {
         delete this.metadataStore.data.files[filePath];

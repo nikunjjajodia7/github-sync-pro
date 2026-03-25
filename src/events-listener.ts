@@ -3,7 +3,7 @@ import MetadataStore, { MANIFEST_FILE_NAME } from "./metadata-store";
 import { GitHubSyncSettings } from "./settings/settings";
 import Logger, { LOG_FILE_NAME } from "./logger";
 import GitHubSyncPlugin from "./main";
-import { isTrackableSyncPath } from "./sync-scope";
+import { isTrackableSyncFolderPath, isTrackableSyncPath } from "./sync-scope";
 
 /**
  * Tracks changes to local sync directory and updates files metadata.
@@ -62,6 +62,19 @@ export default class EventsListener {
     return this.paused;
   }
 
+  private shouldTrackDeletedFolder(folderPath: string): boolean {
+    const leaf = folderPath.split("/").pop() ?? folderPath;
+    return (
+      isTrackableSyncFolderPath(folderPath, {
+        configDir: this.vault.configDir,
+        syncConfigDir: this.settings.syncConfigDir,
+      }) &&
+      !/\.(md|txt|csv|json|png|jpg|jpeg|webp|gif|svg|pdf|mp3|m4a|wav|webm|mp4)$/i.test(
+        leaf,
+      )
+    );
+  }
+
   private async onCreate(file: TAbstractFile) {
     if (this.paused) return;
     await this.logger.info("Received create event", file.path);
@@ -102,6 +115,10 @@ export default class EventsListener {
     const filePath = file instanceof TAbstractFile ? file.path : file;
     await this.logger.info("Received delete event", filePath);
     if (file instanceof TFolder) {
+      if (!this.shouldTrackDeletedFolder(filePath)) {
+        await this.logger.warn("Skipped invalid deleted folder event", filePath);
+        return;
+      }
       // Track folder deletion so it can be propagated to other devices.
       // When a user explicitly deletes a folder, this event fires AFTER
       // the delete events for all files inside it.

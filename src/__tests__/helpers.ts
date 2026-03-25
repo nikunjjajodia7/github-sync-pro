@@ -8,6 +8,17 @@ export function createMockVault(files: Record<string, string | ArrayBuffer> = {}
   const store: Record<string, string | ArrayBuffer> = { ...files };
   const dirs = new Set<string>();
 
+  function addParentDirs(path: string) {
+    const parts = path.split("/").slice(0, -1);
+    let current = "";
+    for (const part of parts) {
+      current = current ? `${current}/${part}` : part;
+      dirs.add(current);
+    }
+  }
+
+  Object.keys(store).forEach(addParentDirs);
+
   const adapter = {
     read: vi.fn(async (path: string) => {
       if (!(path in store)) throw new Error(`File not found: ${path}`);
@@ -16,6 +27,7 @@ export function createMockVault(files: Record<string, string | ArrayBuffer> = {}
       return content;
     }),
     write: vi.fn(async (path: string, data: string) => {
+      addParentDirs(path);
       store[path] = data;
     }),
     readBinary: vi.fn(async (path: string) => {
@@ -27,14 +39,34 @@ export function createMockVault(files: Record<string, string | ArrayBuffer> = {}
       return content;
     }),
     writeBinary: vi.fn(async (path: string, data: ArrayBuffer) => {
+      addParentDirs(path);
       store[path] = data;
     }),
-    exists: vi.fn(async (path: string) => path in store),
+    exists: vi.fn(async (path: string) => {
+      if (path in store || dirs.has(path)) {
+        return true;
+      }
+      const prefix = path === "" || path === "/" ? "" : path + "/";
+      return Object.keys(store).some((key) => key.startsWith(prefix));
+    }),
     mkdir: vi.fn(async (dirPath: string) => {
       dirs.add(dirPath);
     }),
     remove: vi.fn(async (path: string) => {
       delete store[path];
+    }),
+    rmdir: vi.fn(async (dirPath: string, recursive: boolean) => {
+      const prefix = dirPath === "" || dirPath === "/" ? "" : dirPath + "/";
+      const childFiles = Object.keys(store).filter((key) => key.startsWith(prefix));
+      const childDirs = Array.from(dirs).filter((dir) => dir.startsWith(prefix));
+
+      if (!recursive && (childFiles.length > 0 || childDirs.length > 0)) {
+        throw new Error(`Directory not empty: ${dirPath}`);
+      }
+
+      childFiles.forEach((file) => delete store[file]);
+      childDirs.forEach((dir) => dirs.delete(dir));
+      dirs.delete(dirPath);
     }),
     list: vi.fn(async (dirPath: string) => {
       const prefix = dirPath === "" || dirPath === "/" ? "" : dirPath + "/";
@@ -54,6 +86,16 @@ export function createMockVault(files: Record<string, string | ArrayBuffer> = {}
             seen.add(folder);
             foldersList.push(folder);
           }
+        }
+      }
+      for (const dir of Array.from(dirs)) {
+        if (!dir.startsWith(prefix) || dir === dirPath) continue;
+        const rest = dir.slice(prefix.length);
+        const slashIdx = rest.indexOf("/");
+        const folder = slashIdx === -1 ? dir : prefix + rest.slice(0, slashIdx);
+        if (!seen.has(folder)) {
+          seen.add(folder);
+          foldersList.push(folder);
         }
       }
       return { files: filesList, folders: foldersList };
