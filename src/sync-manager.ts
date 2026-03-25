@@ -815,9 +815,17 @@ export default class SyncManager {
         }),
     ]);
 
-    // deletedFolders were already processed before the early-return check
-    // (above). The merged list is in this.metadataStore.data.deletedFolders
-    // and will be included in the manifest snapshot by commitSync().
+    // Retry folder removal after file actions. The first pass (before
+    // early-return) may have found folders non-empty because delete_local
+    // actions hadn't run yet. Now that files are deleted, retry.
+    if (hasRemoteDeletedFolders) {
+      for (const folderPath of remoteMetadata.deletedFolders!) {
+        const normalizedDir = normalizePath(folderPath);
+        if (await this.vault.adapter.exists(normalizedDir)) {
+          await this.removeDirectoryRecursive(normalizedDir);
+        }
+      }
+    }
 
     await this.commitSync(
       newTreeFiles,
