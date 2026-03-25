@@ -35,6 +35,10 @@ export interface FileMetadata {
 export interface Metadata {
   lastSync: number;
   files: { [key: string]: FileMetadata };
+  // Tracks folders that were explicitly deleted by the user.
+  // When syncing, these are removed on the other device.
+  // Entries are purged after they've been synced to remote.
+  deletedFolders?: string[];
 }
 
 /**

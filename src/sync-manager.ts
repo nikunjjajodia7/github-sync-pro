@@ -697,10 +697,16 @@ export default class SyncManager {
         {},
       );
 
+    // Check if local manifest has pending deletedFolders to push
+    const hasDeletedFolders =
+      this.metadataStore.data.deletedFolders &&
+      this.metadataStore.data.deletedFolders.length > 0;
+
     if (actions.length === 0) {
-      if (metadataChanged) {
+      if (metadataChanged || hasDeletedFolders) {
         await this.logger.info(
           "No file actions to sync, committing metadata updates only",
+          { metadataChanged, hasDeletedFolders },
         );
         await this.commitSync(newTreeFiles, treeSha, [], initialHeadSha);
         return;
@@ -781,6 +787,24 @@ export default class SyncManager {
           await this.deleteLocalFile(action.filePath);
         }),
     ]);
+
+    // Propagate folder deletions from the remote manifest.
+    // If the other device explicitly deleted a folder, remove it locally.
+    // Files inside should already be deleted (processed above), but empty
+    // subdirectories may remain — remove them bottom-up.
+    if (remoteMetadata.deletedFolders && remoteMetadata.deletedFolders.length > 0) {
+      for (const folderPath of remoteMetadata.deletedFolders) {
+        const normalizedDir = normalizePath(folderPath);
+        if (await this.vault.adapter.exists(normalizedDir)) {
+          await this.removeDirectoryRecursive(normalizedDir);
+        }
+      }
+    }
+
+    // Clear deletedFolders from local manifest after they've been synced.
+    // They'll be included in the manifest we push to remote, so the other
+    // device will see them on next sync.
+    // After that sync, they can be purged.
 
     await this.commitSync(
       newTreeFiles,
@@ -1282,6 +1306,28 @@ export default class SyncManager {
       }),
     );
 
+    // Clear deletedFolders — they've been pushed to remote manifest,
+    // so the other device will see them on its next sync.
+    if (this.metadataStore.data.deletedFolders) {
+      this.metadataStore.data.deletedFolders = [];
+    }
+
+    // Purge stale tombstones: deleted entries whose parent folder no longer
+    // exists locally. These have served their purpose — the deletion has been
+    // propagated. Keeping them wastes cycles on every sync.
+    const allPaths = Object.keys(this.metadataStore.data.files);
+    for (const filePath of allPaths) {
+      const meta = this.metadataStore.data.files[filePath];
+      if (!meta.deleted) continue;
+      const topFolder = filePath.split("/")[0];
+      const topFolderExists = await this.vault.adapter.exists(
+        normalizePath(topFolder),
+      );
+      if (!topFolderExists) {
+        delete this.metadataStore.data.files[filePath];
+      }
+    }
+
     // Save the fully updated metadata to disk
     await this.metadataStore.save();
     await this.logger.info("Sync done");
@@ -1321,6 +1367,40 @@ export default class SyncManager {
     this.metadataStore.data.files[filePath].deleted = true;
     this.metadataStore.data.files[filePath].deletedAt = Date.now();
     await this.metadataStore.save();
+  }
+
+  /**
+   * Recursively removes a directory and all its empty subdirectories.
+   * Only removes directories that contain no files — if any file still
+   * exists inside, the directory tree is left intact.
+   * Works bottom-up: removes deepest subdirectories first, then parents.
+   */
+  private async removeDirectoryRecursive(dirPath: string) {
+    try {
+      const { files, folders } = await this.vault.adapter.list(dirPath);
+
+      // First, recursively process subdirectories
+      for (const subFolder of folders) {
+        await this.removeDirectoryRecursive(subFolder);
+      }
+
+      // Re-check after subdirectory cleanup
+      const after = await this.vault.adapter.list(dirPath);
+      if (after.files.length === 0 && after.folders.length === 0) {
+        await this.vault.adapter.rmdir(dirPath, false);
+        await this.logger.info(
+          "Removed folder deleted on another device",
+          dirPath,
+        );
+      } else {
+        await this.logger.warn(
+          "Folder not empty after cleanup, keeping it",
+          { dirPath, files: after.files.length, folders: after.folders.length },
+        );
+      }
+    } catch {
+      // Directory might not exist or already been removed
+    }
   }
 
   async loadMetadata() {
