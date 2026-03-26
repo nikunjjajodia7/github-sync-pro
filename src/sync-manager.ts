@@ -755,41 +755,53 @@ export default class SyncManager {
     );
     const hasRemoteDeletedFolders = remoteMetadata.deletedFolders.length > 0;
 
+    // Track folders this device confirmed it deleted during this sync cycle.
+    // Only confirmed deletions are removed from the remote manifest snapshot.
+    // Remote entries for folders that don't exist on this device pass through
+    // unchanged so other devices can still process them.
+    const confirmedDeletedFolders = new Set<string>();
+
     if (hasRemoteDeletedFolders) {
       await this.logger.info(
         "Processing remote deletedFolders",
         remoteMetadata.deletedFolders,
       );
-      if (!this.metadataStore.data.deletedFolders) {
-        this.metadataStore.data.deletedFolders = [];
-      }
-      for (const folderPath of remoteMetadata.deletedFolders!) {
-        if (!this.metadataStore.data.deletedFolders.contains(folderPath)) {
-          this.metadataStore.data.deletedFolders.push(folderPath);
-        }
-      }
 
-      // Remove empty folders locally
+      // DO NOT merge remote entries into local metadata. Local only holds
+      // tombstones for folders deleted on THIS device (via events-listener).
+      // Attempt force-delete on folders that exist on this device.
       for (const folderPath of remoteMetadata.deletedFolders!) {
         const normalizedDir = normalizePath(folderPath);
         if (await this.vault.adapter.exists(normalizedDir)) {
           await this.removeDirectoryRecursive(normalizedDir, { force: true });
+          if (!(await this.vault.adapter.exists(normalizedDir))) {
+            confirmedDeletedFolders.add(folderPath);
+            await this.logger.info("Confirmed folder deletion", folderPath);
+          }
         }
       }
     }
 
-    // Check if local manifest has pending deletedFolders to push
+    // hasDeletedFolders only reflects LOCAL entries (folders deleted on THIS device)
     const hasDeletedFolders =
       this.metadataStore.data.deletedFolders &&
       this.metadataStore.data.deletedFolders.length > 0;
+    const didConfirmDeletions = confirmedDeletedFolders.size > 0;
 
     if (actions.length === 0) {
-      if (metadataChanged || hasDeletedFolders || hasRemoteDeletedFolders) {
+      if (metadataChanged || hasDeletedFolders || didConfirmDeletions) {
         await this.logger.info(
           "No file actions to sync, committing metadata updates only",
-          { metadataChanged, hasDeletedFolders, hasRemoteDeletedFolders },
+          { metadataChanged, hasDeletedFolders, didConfirmDeletions },
         );
-        await this.commitSync(newTreeFiles, treeSha, [], initialHeadSha);
+        await this.commitSync(
+          newTreeFiles,
+          treeSha,
+          [],
+          initialHeadSha,
+          remoteMetadata.deletedFolders,
+          confirmedDeletedFolders,
+        );
         return;
       }
       // Nothing to sync
@@ -877,7 +889,35 @@ export default class SyncManager {
         const normalizedDir = normalizePath(folderPath);
         if (await this.vault.adapter.exists(normalizedDir)) {
           await this.removeDirectoryRecursive(normalizedDir, { force: true });
+          if (!(await this.vault.adapter.exists(normalizedDir))) {
+            confirmedDeletedFolders.add(folderPath);
+            await this.logger.info("Confirmed folder deletion", folderPath);
+          }
         }
+      }
+    }
+
+    // Sweep for empty folder shells left behind by deleted files.
+    // Only removes genuinely empty directories — never deletes files.
+    const folderCandidates = new Set<string>();
+    for (const [filePath, meta] of Object.entries(
+      this.metadataStore.data.files,
+    )) {
+      if (meta.deleted) {
+        const parts = filePath.split("/");
+        for (let i = 1; i < parts.length; i++) {
+          folderCandidates.add(parts.slice(0, i).join("/"));
+        }
+      }
+    }
+    // Sort deepest-first so children are removed before parents
+    const sortedFolders = [...folderCandidates].sort(
+      (a, b) => b.split("/").length - a.split("/").length,
+    );
+    for (const folder of sortedFolders) {
+      const normalizedDir = normalizePath(folder);
+      if (await this.vault.adapter.exists(normalizedDir)) {
+        await this.removeDirectoryRecursive(normalizedDir);
       }
     }
 
@@ -886,6 +926,8 @@ export default class SyncManager {
       treeSha,
       conflictResolutions,
       initialHeadSha,
+      remoteMetadata.deletedFolders,
+      confirmedDeletedFolders,
     );
   }
 
@@ -1267,6 +1309,8 @@ export default class SyncManager {
     baseTreeSha: string,
     conflictResolutions: ConflictResolution[] = [],
     expectedHeadSha?: string,
+    remoteDeletedFolders?: string[],
+    confirmedDeletedFolders?: Set<string>,
   ) {
     // Sync timestamp — used for manifest snapshot but NOT applied to live
     // metadataStore until after commit succeeds (deferred writes pattern).
@@ -1322,6 +1366,29 @@ export default class SyncManager {
         manifestSnapshot.files[resolution.filePath].lastModified = syncTime;
       }
     });
+
+    // Build snapshot deletedFolders from three sources:
+    // 1. Local entries (folders deleted on THIS device)
+    // 2. Remote entries passed through (for other devices)
+    // 3. MINUS entries this device confirmed it deleted this cycle
+    const snapshotDf: string[] = [];
+    if (manifestSnapshot.deletedFolders) {
+      for (const entry of manifestSnapshot.deletedFolders) {
+        if (!snapshotDf.includes(entry)) {
+          snapshotDf.push(entry);
+        }
+      }
+    }
+    if (remoteDeletedFolders) {
+      for (const entry of remoteDeletedFolders) {
+        const wasConfirmed = confirmedDeletedFolders?.has(entry) ?? false;
+        if (!wasConfirmed && !snapshotDf.includes(entry)) {
+          snapshotDf.push(entry);
+        }
+      }
+    }
+    manifestSnapshot.deletedFolders =
+      snapshotDf.length > 0 ? snapshotDf : undefined;
 
     // Update manifest in list of new tree items
     delete treeFiles[`${this.vault.configDir}/${MANIFEST_FILE_NAME}`].sha;
@@ -1381,12 +1448,11 @@ export default class SyncManager {
       }),
     );
 
-    // Process deletedFolders from the REMOTE manifest — these are folders
-    // that the other device deleted. Remove them locally if they're empty.
-    // (This runs on the receiving device, not the device that deleted.)
-    // Note: deletedFolders are kept in the manifest until they're old enough
-    // that all devices have had time to process them. We remove entries that
-    // we've already processed (folder no longer exists locally).
+    // Clean up local deletedFolders. After the fix, local only contains
+    // tombstones for folders deleted on THIS device (via events-listener).
+    // Remote entries are never merged into local — they pass through the
+    // snapshot separately. Drop local entries where the folder no longer
+    // exists (tombstone was already pushed to remote for other devices).
     if (this.metadataStore.data.deletedFolders) {
       this.metadataStore.data.deletedFolders = this.sanitizeDeletedFolders(
         this.metadataStore.data.deletedFolders,
@@ -1396,11 +1462,8 @@ export default class SyncManager {
         const normalizedDir = normalizePath(folderPath);
         const exists = await this.vault.adapter.exists(normalizedDir);
         if (exists) {
-          // Still exists — keep in the list for the remote manifest so
-          // other devices can process it too
           remaining.push(folderPath);
         }
-        // If it doesn't exist, we've already removed it — drop from list
       }
       this.metadataStore.data.deletedFolders = remaining;
     }
@@ -1541,6 +1604,16 @@ export default class SyncManager {
         cleaned = true;
       }
     });
+
+    // Normalize: clear dirty flag on deleted entries. deleted+dirty is an
+    // inconsistent state that serves no purpose — deleted files never generate
+    // upload actions regardless of the dirty flag.
+    for (const meta of Object.values(this.metadataStore.data.files)) {
+      if (meta.deleted && meta.dirty) {
+        meta.dirty = false;
+        cleaned = true;
+      }
+    }
     if (cleaned) {
       await this.metadataStore.save();
     }
