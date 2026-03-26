@@ -782,32 +782,6 @@ export default class SyncManager {
       }
     }
 
-    // Sweep for empty folder shells left behind by deleted files.
-    // Only removes genuinely empty directories — never deletes files.
-    // Runs before the early-return check so it executes every sync cycle.
-    const folderCandidates = new Set<string>();
-    for (const [filePath, meta] of Object.entries(
-      this.metadataStore.data.files,
-    )) {
-      if (meta.deleted) {
-        const parts = filePath.split("/");
-        for (let i = 1; i < parts.length; i++) {
-          folderCandidates.add(parts.slice(0, i).join("/"));
-        }
-      }
-    }
-    if (folderCandidates.size > 0) {
-      const sortedFolders = [...folderCandidates].sort(
-        (a, b) => b.split("/").length - a.split("/").length,
-      );
-      for (const folder of sortedFolders) {
-        const normalizedDir = normalizePath(folder);
-        if (await this.vault.adapter.exists(normalizedDir)) {
-          await this.removeDirectoryRecursive(normalizedDir);
-        }
-      }
-    }
-
     // hasDeletedFolders only reflects LOCAL entries (folders deleted on THIS device)
     const hasDeletedFolders =
       this.metadataStore.data.deletedFolders &&
@@ -922,8 +896,6 @@ export default class SyncManager {
         }
       }
     }
-
-    // Orphan sweep already ran before the early-return check (above).
 
     await this.commitSync(
       newTreeFiles,
