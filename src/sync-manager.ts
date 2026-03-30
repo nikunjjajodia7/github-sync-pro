@@ -92,6 +92,14 @@ export default class SyncManager {
     );
   }
 
+  private isEnoentError(err: unknown): boolean {
+    if (!(err instanceof Error)) {
+      return false;
+    }
+    const code = (err as Error & { code?: string }).code;
+    return code === "ENOENT" || err.message.includes("ENOENT");
+  }
+
   private sanitizeDeletedFolders(
     deletedFolders?: string[],
     metadataFiles: { [key: string]: FileMetadata } = this.metadataStore.data.files,
@@ -580,6 +588,11 @@ export default class SyncManager {
       metadataChanged = true;
     }
 
+    const reconciledEntries = await this.reconcileMissingLocalMetadataEntries();
+    if (reconciledEntries > 0) {
+      metadataChanged = true;
+    }
+
     // Reconcile remote metadata with the actual remote tree state to support
     // changes made outside of this plugin (PRs/direct commits/other tools).
     Object.keys(files).forEach((filePath: string) => {
@@ -877,6 +890,14 @@ export default class SyncManager {
       ...actions
         .filter((action) => action.type === "delete_local")
         .map(async (action: SyncAction) => {
+          const meta = this.metadataStore.data.files[action.filePath];
+          if (meta?.deleted) {
+            await this.logger.info(
+              "Skipping delete_local for already deleted metadata entry",
+              action.filePath,
+            );
+            return;
+          }
           await this.deleteLocalFile(action.filePath);
         }),
     ]);
@@ -971,6 +992,36 @@ export default class SyncManager {
       });
     }
     return removedCount;
+  }
+
+  private async reconcileMissingLocalMetadataEntries(): Promise<number> {
+    const reconciledPaths: string[] = [];
+    const manifestPath = `${this.vault.configDir}/${MANIFEST_FILE_NAME}`;
+    const logPath = `${this.vault.configDir}/${LOG_FILE_NAME}`;
+
+    for (const [filePath, meta] of Object.entries(this.metadataStore.data.files)) {
+      if (filePath === manifestPath || filePath === logPath || meta.deleted) {
+        continue;
+      }
+
+      if (!(await this.vault.adapter.exists(normalizePath(filePath)))) {
+        meta.deleted = true;
+        meta.deletedAt = meta.deletedAt ?? Date.now();
+        meta.dirty = false;
+        meta.justDownloaded = false;
+        reconciledPaths.push(filePath);
+      }
+    }
+
+    if (reconciledPaths.length > 0) {
+      await this.metadataStore.save();
+      await this.logger.warn("Reconciled missing local metadata entries", {
+        count: reconciledPaths.length,
+        sample: reconciledPaths.slice(0, 5),
+      });
+    }
+
+    return reconciledPaths.length;
   }
 
   /**
@@ -1495,9 +1546,35 @@ export default class SyncManager {
 
   async deleteLocalFile(filePath: string) {
     const normalizedPath = normalizePath(filePath);
-    await this.vault.adapter.remove(normalizedPath);
-    this.metadataStore.data.files[filePath].deleted = true;
-    this.metadataStore.data.files[filePath].deletedAt = Date.now();
+    const meta = this.metadataStore.data.files[filePath];
+    if (!meta) {
+      return;
+    }
+
+    const exists = await this.vault.adapter.exists(normalizedPath);
+    if (exists) {
+      try {
+        await this.vault.adapter.remove(normalizedPath);
+      } catch (err) {
+        if (!this.isEnoentError(err)) {
+          throw err;
+        }
+        await this.logger.warn(
+          "Local file disappeared during delete_local, treating as already deleted",
+          filePath,
+        );
+      }
+    } else {
+      await this.logger.info(
+        "Local file already missing during delete_local, tombstoning metadata",
+        filePath,
+      );
+    }
+
+    meta.deleted = true;
+    meta.deletedAt = meta.deletedAt ?? Date.now();
+    meta.dirty = false;
+    meta.justDownloaded = false;
     await this.metadataStore.save();
   }
 
