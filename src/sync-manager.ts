@@ -66,8 +66,10 @@ interface ReconcileDecision {
 interface CommitPlan {
   actions: SyncAction[];
   baseTreeSha: string;
+  confirmedDeletedFolders?: Set<string>;
   expectedHeadSha: string;
   conflictResolutions: ConflictResolution[];
+  remoteDeletedFolders?: string[];
   treeFiles: { [key: string]: NewTreeRequestItem };
 }
 
@@ -220,15 +222,25 @@ export default class SyncManager {
   private async applyExplicitFolderDeleteIntents(
     remoteMetadata: Metadata,
     remoteTreeFiles: { [key: string]: GetTreeResponseItem },
-  ): Promise<ExplicitFolderDelete[]> {
+  ): Promise<{
+    explicitFolderDeletes: ExplicitFolderDelete[];
+    metadataChanged: boolean;
+  }> {
+    const initialDeletedFolders = JSON.stringify(
+      this.sanitizeDeletedFolders(remoteMetadata.deletedFolders, remoteMetadata.files),
+    );
     const explicitFolderDeletes = this.filterExplicitFolderDeletes(
       this.getExplicitFolderDeletes(remoteMetadata),
       remoteMetadata.files,
       remoteTreeFiles,
     );
+    let metadataChanged = false;
     if (explicitFolderDeletes.length === 0) {
-      delete remoteMetadata.deletedFolders;
-      return [];
+      if (remoteMetadata.deletedFolders !== undefined) {
+        delete remoteMetadata.deletedFolders;
+        metadataChanged = true;
+      }
+      return { explicitFolderDeletes: [], metadataChanged };
     }
 
     const now = Date.now();
@@ -264,6 +276,7 @@ export default class SyncManager {
           if (!existing.deleted) {
             existing.deleted = true;
             existing.deletedAt = existing.deletedAt ?? now;
+            metadataChanged = true;
           }
           continue;
         }
@@ -277,14 +290,20 @@ export default class SyncManager {
           deleted: true,
           deletedAt: now,
         };
+        metadataChanged = true;
       }
     }
 
     remoteMetadata.deletedFolders = explicitFolderDeletes.map((folder) => folder.path);
+    if (
+      initialDeletedFolders !== JSON.stringify(remoteMetadata.deletedFolders ?? [])
+    ) {
+      metadataChanged = true;
+    }
     await this.logger.info("Expanded explicit folder delete intents into tracked file tombstones", {
       folderCount: explicitFolderDeletes.length,
     });
-    return explicitFolderDeletes;
+    return { explicitFolderDeletes, metadataChanged };
   }
 
   private async buildRemoteSnapshot(): Promise<RemoteSnapshot> {
@@ -329,11 +348,14 @@ export default class SyncManager {
       }
     }
 
-    const explicitFolderDeletes = await this.applyExplicitFolderDeleteIntents(
+    const {
+      explicitFolderDeletes,
+      metadataChanged: explicitFolderDeleteMetadataChanged,
+    } = await this.applyExplicitFolderDeleteIntents(
       remoteMetadata,
       files,
     );
-    if (explicitFolderDeletes.length > 0) {
+    if (explicitFolderDeleteMetadataChanged) {
       metadataChanged = true;
     }
 
@@ -535,28 +557,32 @@ export default class SyncManager {
     return removedFolders;
   }
 
-  private mergeExplicitFolderDeletesIntoLocal(
-    explicitFolderDeletes: ExplicitFolderDelete[],
-  ): boolean {
-    const current = this.sanitizeDeletedFolders(
-      this.metadataStore.data.deletedFolders,
-      this.metadataStore.data.files,
-    );
-    const merged = new Set(current);
-    let changed = false;
+  private buildManifestDeletedFolders(
+    metadataFiles: { [key: string]: FileMetadata },
+    treeFiles: { [key: string]: { path?: string } },
+    remoteDeletedFolders: string[] = [],
+    confirmedDeletedFolders: Set<string> = new Set(),
+  ): string[] {
+    const pendingFolders = [
+      ...this.sanitizeDeletedFolders(
+        this.metadataStore.data.deletedFolders,
+        this.metadataStore.data.files,
+      ),
+      ...remoteDeletedFolders.filter(
+        (folderPath) => !confirmedDeletedFolders.has(folderPath),
+      ),
+    ];
 
-    for (const folder of explicitFolderDeletes) {
-      if (!merged.has(folder.path)) {
-        merged.add(folder.path);
-        changed = true;
-      }
-    }
+    const uniqueFolders = Array.from(new Set(pendingFolders)).map((folderPath) => ({
+      path: folderPath,
+      deletedAt: null,
+    }));
 
-    if (changed) {
-      this.metadataStore.data.deletedFolders = Array.from(merged);
-    }
-
-    return changed;
+    return this.filterExplicitFolderDeletes(
+      uniqueFolders,
+      metadataFiles,
+      treeFiles,
+    ).map((folder) => folder.path);
   }
 
   private buildInitialCommitTree(
@@ -629,6 +655,8 @@ export default class SyncManager {
       plan.baseTreeSha,
       plan.conflictResolutions,
       plan.expectedHeadSha,
+      plan.remoteDeletedFolders,
+      plan.confirmedDeletedFolders,
     );
   }
 
@@ -1028,9 +1056,11 @@ export default class SyncManager {
       remoteSnapshot.metadata.files,
       this.metadataStore.data.files,
     );
-    const mergedRemoteFolderDeletes = this.mergeExplicitFolderDeletesIntoLocal(
-      remoteSnapshot.explicitFolderDeletes,
-    );
+    const hasLocalDeletedFolders =
+      this.sanitizeDeletedFolders(
+        this.metadataStore.data.deletedFolders,
+        this.metadataStore.data.files,
+      ).length > 0;
 
     // We treat every resolved conflict as an upload SyncAction, mainly cause
     // the user has complete freedom on the edits they can apply to the conflicting files.
@@ -1106,26 +1136,35 @@ export default class SyncManager {
       ...conflictActions,
     ];
 
+    let confirmedDeletedFolders = await this.applyExplicitFolderDeletes(
+      remoteSnapshot.explicitFolderDeletes,
+    );
+
     if (actions.length === 0) {
-      await this.applyExplicitFolderDeletes(remoteSnapshot.explicitFolderDeletes);
       if (
         remoteSnapshot.metadataChanged ||
         localSnapshot.metadataChanged ||
-        mergedRemoteFolderDeletes
+        hasLocalDeletedFolders ||
+        confirmedDeletedFolders.size > 0
       ) {
         await this.logger.info(
           "No file actions to sync, committing metadata updates only",
           {
             remoteMetadataChanged: remoteSnapshot.metadataChanged,
             localMetadataChanged: localSnapshot.metadataChanged,
-            mergedRemoteFolderDeletes,
+            hasLocalDeletedFolders,
+            confirmedDeletedFolders: Array.from(confirmedDeletedFolders),
           },
         );
         await this.commitRemotePlan({
           actions: [],
           baseTreeSha: remoteSnapshot.treeSha,
+          confirmedDeletedFolders,
           expectedHeadSha: initialHeadSha,
           conflictResolutions: [],
+          remoteDeletedFolders: remoteSnapshot.explicitFolderDeletes.map(
+            (folder) => folder.path,
+          ),
           treeFiles: this.buildInitialCommitTree(remoteSnapshot.treeFiles),
         });
         return;
@@ -1141,13 +1180,23 @@ export default class SyncManager {
       remoteSnapshot.treeFiles,
       remoteSnapshot.metadata.files,
     );
-    await this.applyExplicitFolderDeletes(remoteSnapshot.explicitFolderDeletes);
+    const postActionConfirmedDeletedFolders = await this.applyExplicitFolderDeletes(
+      remoteSnapshot.explicitFolderDeletes,
+    );
+    confirmedDeletedFolders = new Set([
+      ...confirmedDeletedFolders,
+      ...postActionConfirmedDeletedFolders,
+    ]);
 
     await this.commitRemotePlan({
       actions,
       baseTreeSha: remoteSnapshot.treeSha,
+      confirmedDeletedFolders,
       expectedHeadSha: initialHeadSha,
       conflictResolutions,
+      remoteDeletedFolders: remoteSnapshot.explicitFolderDeletes.map(
+        (folder) => folder.path,
+      ),
       treeFiles: this.buildInitialCommitTree(remoteSnapshot.treeFiles),
     });
   }
@@ -1547,6 +1596,8 @@ export default class SyncManager {
     baseTreeSha: string,
     conflictResolutions: ConflictResolution[] = [],
     expectedHeadSha?: string,
+    remoteDeletedFolders: string[] = [],
+    confirmedDeletedFolders: Set<string> = new Set(),
   ) {
     // Sync timestamp — used for manifest snapshot but NOT applied to live
     // metadataStore until after commit succeeds (deferred writes pattern).
@@ -1605,14 +1656,15 @@ export default class SyncManager {
     const liveTreeFiles = Object.fromEntries(
       Object.entries(treeFiles).filter(([, item]) => item.sha !== null || item.content),
     );
-    const remainingExplicitFolderDeletes = this.filterExplicitFolderDeletes(
-      this.getExplicitFolderDeletes(this.metadataStore.data),
+    const remainingExplicitFolderDeletes = this.buildManifestDeletedFolders(
       manifestSnapshot.files,
       liveTreeFiles,
+      remoteDeletedFolders,
+      confirmedDeletedFolders,
     );
     manifestSnapshot.deletedFolders =
       remainingExplicitFolderDeletes.length > 0
-        ? remainingExplicitFolderDeletes.map((folder) => folder.path)
+        ? remainingExplicitFolderDeletes
         : undefined;
 
     // Update manifest in list of new tree items
@@ -1673,7 +1725,7 @@ export default class SyncManager {
       }),
     );
 
-    this.metadataStore.data.deletedFolders = manifestSnapshot.deletedFolders;
+    delete this.metadataStore.data.deletedFolders;
 
     // Purge stale tombstones: deleted entries whose parent folder no longer
     // exists locally. These have served their purpose — the deletion has been

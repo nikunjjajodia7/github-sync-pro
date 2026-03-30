@@ -191,6 +191,52 @@ describe("folder deletion propagation", () => {
     expect(snapshot.metadata.files["Projects/unknown.md"]).toBeUndefined();
   });
 
+  it("does not treat already-expanded explicit folder deletes as remote metadata changes", async () => {
+    const syncManager = new SyncManager(
+      vault as any,
+      settings,
+      async () => [],
+      createMockLogger() as any,
+    );
+    const metadataStore = createMockMetadataStore();
+    (syncManager as any).metadataStore = metadataStore;
+
+    const client = createMockGithubClient();
+    client.getRepoContent.mockResolvedValue({
+      files: {
+        ".obsidian/github-sync-metadata.json": makeTreeFile(
+          ".obsidian/github-sync-metadata.json",
+          "manifest-sha",
+        ),
+      },
+      sha: "tree-sha",
+    });
+    client.getBlob.mockResolvedValue({
+      content: Buffer.from(
+        JSON.stringify({
+          lastSync: 0,
+          files: {
+            "Projects/known.md": {
+              path: "Projects/known.md",
+              sha: null,
+              dirty: false,
+              justDownloaded: false,
+              lastModified: 1,
+              deleted: true,
+              deletedAt: 1,
+            },
+          },
+          deletedFolders: ["Projects"],
+        }),
+      ).toString("base64"),
+    });
+    (syncManager as any).client = client;
+
+    const snapshot = await (syncManager as any).buildRemoteSnapshot();
+
+    expect(snapshot.metadataChanged).toBe(false);
+  });
+
   it("removes an explicitly deleted folder only when it is empty after file reconciliation", async () => {
     vault = createMockVault({
       ".obsidian/github-sync-metadata.json": JSON.stringify({ lastSync: 0, files: {} }),
@@ -232,5 +278,47 @@ describe("folder deletion propagation", () => {
     expect(removed.has("Projects")).toBe(false);
     expect(await vault.adapter.exists("Projects")).toBe(true);
     expect(await vault.adapter.exists("Projects/new.md")).toBe(true);
+  });
+
+  it("clears remote explicit folder delete intent after local confirmation", async () => {
+    const syncManager = new SyncManager(
+      vault as any,
+      settings,
+      async () => [],
+      createMockLogger() as any,
+    );
+    const metadataStore = createMockMetadataStore();
+    (syncManager as any).metadataStore = metadataStore;
+
+    const client = createMockGithubClient();
+    client.createTree.mockResolvedValue("new-tree-sha");
+    client.getBranchHeadSha.mockResolvedValue("head-sha");
+    client.createCommit.mockResolvedValue("commit-sha");
+    client.updateBranchHead.mockResolvedValue(undefined);
+    (syncManager as any).client = client;
+
+    const manifestPath = ".obsidian/github-sync-metadata.json";
+    const treeFiles = {
+      [manifestPath]: {
+        path: manifestPath,
+        mode: "100644",
+        type: "blob",
+        sha: "manifest-sha",
+      },
+    };
+
+    await (syncManager as any).commitSync(
+      treeFiles,
+      "base-tree-sha",
+      [],
+      "head-sha",
+      ["Projects"],
+      new Set(["Projects"]),
+    );
+
+    expect(metadataStore.data.deletedFolders).toBeUndefined();
+    expect(
+      JSON.parse((treeFiles as any)[manifestPath].content).deletedFolders,
+    ).toBeUndefined();
   });
 });
