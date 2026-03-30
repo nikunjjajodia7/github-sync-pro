@@ -131,6 +131,49 @@ describe("SyncManager delete regression hardening", () => {
     expect(metadataStore.save).toHaveBeenCalledTimes(1);
   });
 
+  it("does not prune empty parent folders for ordinary file tombstones", async () => {
+    vault = createMockVault({
+      ".obsidian/github-sync-metadata.json": JSON.stringify({
+        lastSync: 0,
+        files: {},
+      }),
+      "Projects/ghost.md": "content",
+    });
+    logger = createMockLogger();
+    metadataStore = createMockMetadataStore({
+      "Projects/ghost.md": makeFileMetadata("Projects/ghost.md"),
+    });
+    syncManager = new SyncManager(
+      vault as any,
+      {
+        firstSync: false,
+        githubToken: "test",
+        githubOwner: "owner",
+        githubRepo: "repo",
+        githubBranch: "main",
+        syncScopeMode: "notes-first",
+        syncStrategy: "manual",
+        syncInterval: 5,
+        syncOnStartup: false,
+        syncConfigDir: false,
+        conflictHandling: "ask",
+        conflictViewMode: "default",
+        showStatusBarItem: true,
+        showSyncRibbonButton: true,
+        showConflictsRibbonButton: true,
+        enableLogging: false,
+      },
+      async () => [],
+      logger as any,
+    );
+    (syncManager as any).metadataStore = metadataStore;
+
+    await expect(syncManager.deleteLocalFile("Projects/ghost.md")).resolves.toBeUndefined();
+
+    expect(await vault.adapter.exists("Projects")).toBe(true);
+    expect(vault.adapter.rmdir).not.toHaveBeenCalled();
+  });
+
   it("swallows ENOENT from remove and still tombstones metadata", async () => {
     vault = createMockVault({
       ".obsidian/github-sync-metadata.json": JSON.stringify({
