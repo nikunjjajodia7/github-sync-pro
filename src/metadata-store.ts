@@ -32,6 +32,11 @@ export interface FileMetadata {
   deletedAt?: number | null;
 }
 
+export interface ExplicitFolderDelete {
+  path: string;
+  deletedAt?: number | null;
+}
+
 export interface Metadata {
   lastSync: number;
   files: { [key: string]: FileMetadata };

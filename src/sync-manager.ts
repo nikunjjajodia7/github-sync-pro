@@ -11,6 +11,7 @@ import GithubClient, {
   RepoContent,
 } from "./github/client";
 import MetadataStore, {
+  ExplicitFolderDelete,
   FileMetadata,
   Metadata,
   MANIFEST_FILE_NAME,
@@ -26,6 +27,48 @@ import { isTrackableSyncFolderPath, isTrackableSyncPath } from "./sync-scope";
 interface SyncAction {
   type: "upload" | "download" | "delete_local" | "delete_remote";
   filePath: string;
+}
+
+type ReconcileDecisionType =
+  | "noop"
+  | "upload"
+  | "download"
+  | "delete_local"
+  | "delete_remote"
+  | "conflict";
+
+interface PathState {
+  path: string;
+  localMetadata?: FileMetadata;
+  remoteMetadata?: FileMetadata;
+  remoteTree?: GetTreeResponseItem;
+  actualLocalSha: string | null;
+}
+
+interface LocalSnapshot {
+  metadataChanged: boolean;
+  pathStates: { [key: string]: PathState };
+}
+
+interface RemoteSnapshot {
+  explicitFolderDeletes: ExplicitFolderDelete[];
+  metadata: Metadata;
+  metadataChanged: boolean;
+  treeFiles: { [key: string]: GetTreeResponseItem };
+  treeSha: string;
+}
+
+interface ReconcileDecision {
+  type: ReconcileDecisionType;
+  filePath: string;
+}
+
+interface CommitPlan {
+  actions: SyncAction[];
+  baseTreeSha: string;
+  expectedHeadSha: string;
+  conflictResolutions: ConflictResolution[];
+  treeFiles: { [key: string]: NewTreeRequestItem };
 }
 
 export interface ConflictFile {
@@ -143,6 +186,450 @@ export default class SyncManager {
     }
 
     return sanitized;
+  }
+
+  private getExplicitFolderDeletes(metadata: Metadata): ExplicitFolderDelete[] {
+    const deletedFolders = this.sanitizeDeletedFolders(
+      metadata.deletedFolders,
+      metadata.files,
+    );
+
+    return deletedFolders.map((folderPath) => ({
+      path: folderPath,
+      deletedAt: null,
+    }));
+  }
+
+  private filterExplicitFolderDeletes(
+    deletedFolders: ExplicitFolderDelete[],
+    metadataFiles: { [key: string]: FileMetadata },
+    treeFiles: { [key: string]: { path?: string } } = {},
+  ): ExplicitFolderDelete[] {
+    return deletedFolders.filter((folder) => {
+      const hasLiveRemoteDescendant = Object.keys(treeFiles).some((filePath) =>
+        filePath.startsWith(`${folder.path}/`),
+      );
+      const hasLiveMetadataDescendant = Object.entries(metadataFiles).some(
+        ([filePath, meta]) =>
+          filePath.startsWith(`${folder.path}/`) && !meta.deleted,
+      );
+      return !hasLiveRemoteDescendant && !hasLiveMetadataDescendant;
+    });
+  }
+
+  private async applyExplicitFolderDeleteIntents(
+    remoteMetadata: Metadata,
+    remoteTreeFiles: { [key: string]: GetTreeResponseItem },
+  ): Promise<ExplicitFolderDelete[]> {
+    const explicitFolderDeletes = this.filterExplicitFolderDeletes(
+      this.getExplicitFolderDeletes(remoteMetadata),
+      remoteMetadata.files,
+      remoteTreeFiles,
+    );
+    if (explicitFolderDeletes.length === 0) {
+      delete remoteMetadata.deletedFolders;
+      return [];
+    }
+
+    const now = Date.now();
+
+    for (const folder of explicitFolderDeletes) {
+      const folderPath = folder.path;
+      const trackedDescendants = new Set<string>();
+
+      Object.keys(remoteMetadata.files).forEach((filePath) => {
+        if (filePath.startsWith(`${folderPath}/`)) {
+          trackedDescendants.add(filePath);
+        }
+      });
+      Object.keys(this.metadataStore.data.files).forEach((filePath) => {
+        if (
+          filePath.startsWith(`${folderPath}/`) &&
+          this.isTrackablePath(filePath, true)
+        ) {
+          trackedDescendants.add(filePath);
+        }
+      });
+
+      for (const filePath of trackedDescendants) {
+        if (this.shouldSkipSyncPath(filePath)) {
+          continue;
+        }
+        if (remoteTreeFiles[filePath]) {
+          continue;
+        }
+
+        const existing = remoteMetadata.files[filePath];
+        if (existing) {
+          if (!existing.deleted) {
+            existing.deleted = true;
+            existing.deletedAt = existing.deletedAt ?? now;
+          }
+          continue;
+        }
+
+        remoteMetadata.files[filePath] = {
+          path: filePath,
+          sha: null,
+          dirty: false,
+          justDownloaded: false,
+          lastModified: now,
+          deleted: true,
+          deletedAt: now,
+        };
+      }
+    }
+
+    remoteMetadata.deletedFolders = explicitFolderDeletes.map((folder) => folder.path);
+    await this.logger.info("Expanded explicit folder delete intents into tracked file tombstones", {
+      folderCount: explicitFolderDeletes.length,
+    });
+    return explicitFolderDeletes;
+  }
+
+  private async buildRemoteSnapshot(): Promise<RemoteSnapshot> {
+    const { files, sha: treeSha } = await this.client.getRepoContent({
+      retry: true,
+    });
+    const manifestPath = `${this.vault.configDir}/${MANIFEST_FILE_NAME}`;
+    const manifest = files[manifestPath];
+
+    if (Object.keys(files).contains(`${this.vault.configDir}/${LOG_FILE_NAME}`)) {
+      delete files[`${this.vault.configDir}/${LOG_FILE_NAME}`];
+    }
+
+    let remoteMetadata: Metadata;
+    let metadataChanged = false;
+
+    if (manifest === undefined) {
+      await this.logger.warn(
+        "Remote manifest missing, creating from tree state",
+        { fileCount: Object.keys(files).length },
+      );
+      new Notice(
+        "No sync manifest found. Creating one from current repo state. Some sync history may be lost.",
+      );
+      remoteMetadata = { lastSync: 0, files: {} };
+      Object.keys(files).forEach((filePath: string) => {
+        if (this.shouldSkipSyncPath(filePath)) return;
+        remoteMetadata.files[filePath] = {
+          path: filePath,
+          sha: files[filePath].sha,
+          dirty: false,
+          justDownloaded: false,
+          lastModified: Date.now(),
+        };
+      });
+      metadataChanged = true;
+    } else {
+      const blob = await this.client.getBlob({ sha: manifest.sha });
+      remoteMetadata = JSON.parse(decodeBase64String(blob.content));
+      if (!remoteMetadata.files) {
+        remoteMetadata.files = {};
+      }
+    }
+
+    const explicitFolderDeletes = await this.applyExplicitFolderDeleteIntents(
+      remoteMetadata,
+      files,
+    );
+    if (explicitFolderDeletes.length > 0) {
+      metadataChanged = true;
+    }
+
+    Object.keys(files).forEach((filePath: string) => {
+      if (this.shouldSkipSyncPath(filePath)) {
+        return;
+      }
+      const treeFile = files[filePath];
+      const metadataFile = remoteMetadata.files[filePath];
+      if (metadataFile) {
+        if (metadataFile.sha !== treeFile.sha) {
+          metadataFile.lastModified = Date.now();
+          metadataChanged = true;
+        }
+        metadataFile.sha = treeFile.sha;
+        if (metadataFile.deleted) {
+          metadataFile.deleted = false;
+          delete metadataFile.deletedAt;
+          metadataChanged = true;
+        }
+      } else {
+        remoteMetadata.files[filePath] = {
+          path: filePath,
+          sha: treeFile.sha,
+          dirty: false,
+          justDownloaded: false,
+          lastModified: Date.now(),
+        };
+        metadataChanged = true;
+      }
+    });
+
+    Object.keys(remoteMetadata.files).forEach((filePath: string) => {
+      if (this.shouldSkipSyncPath(filePath)) {
+        return;
+      }
+      if (!files[filePath] && !remoteMetadata.files[filePath].deleted) {
+        remoteMetadata.files[filePath].deleted = true;
+        remoteMetadata.files[filePath].deletedAt = Date.now();
+        metadataChanged = true;
+      }
+    });
+
+    return {
+      explicitFolderDeletes,
+      metadata: remoteMetadata,
+      metadataChanged,
+      treeFiles: files,
+      treeSha,
+    };
+  }
+
+  private async buildLocalSnapshot(
+    remoteSnapshot: RemoteSnapshot,
+  ): Promise<LocalSnapshot> {
+    let metadataChanged = false;
+
+    const removedEntries = await this.cleanupUntrackableMetadataEntries();
+    if (removedEntries > 0) {
+      metadataChanged = true;
+    }
+
+    const reconciledEntries = await this.reconcileMissingLocalMetadataEntries();
+    if (reconciledEntries > 0) {
+      metadataChanged = true;
+    }
+
+    const hydratedEntries = await this.hydrateMissingBaselines(
+      remoteSnapshot.treeFiles,
+      remoteSnapshot.metadata.files,
+    );
+    if (hydratedEntries > 0) {
+      metadataChanged = true;
+    }
+
+    return {
+      metadataChanged,
+      pathStates: await this.buildPathStates(
+        remoteSnapshot.metadata.files,
+        remoteSnapshot.treeFiles,
+        this.metadataStore.data.files,
+      ),
+    };
+  }
+
+  private async buildPathStates(
+    remoteFiles: { [key: string]: FileMetadata },
+    remoteTreeFiles: { [key: string]: GetTreeResponseItem },
+    localFiles: { [key: string]: FileMetadata },
+  ): Promise<{ [key: string]: PathState }> {
+    const pathStates: { [key: string]: PathState } = {};
+    const allPaths = new Set<string>([
+      ...Object.keys(remoteFiles),
+      ...Object.keys(remoteTreeFiles),
+      ...Object.keys(localFiles),
+    ]);
+
+    await Promise.all(
+      Array.from(allPaths).map(async (filePath) => {
+        if (
+          this.shouldSkipSyncPath(filePath) ||
+          filePath === `${this.vault.configDir}/${MANIFEST_FILE_NAME}`
+        ) {
+          return;
+        }
+
+        pathStates[filePath] = {
+          path: filePath,
+          localMetadata: localFiles[filePath],
+          remoteMetadata: remoteFiles[filePath],
+          remoteTree: remoteTreeFiles[filePath],
+          actualLocalSha: await this.calculateSHA(filePath),
+        };
+      }),
+    );
+
+    return pathStates;
+  }
+
+  private async planReconciliation(
+    remoteFiles: { [key: string]: FileMetadata },
+    localFiles: { [key: string]: FileMetadata },
+  ): Promise<{
+    conflicts: ConflictFile[];
+    decisions: ReconcileDecision[];
+  }> {
+    const conflicts = await this.findConflicts(remoteFiles);
+    const actions = await this.determineSyncActions(
+      remoteFiles,
+      localFiles,
+      conflicts.map((conflict) => conflict.filePath),
+    );
+    const decisions: ReconcileDecision[] = actions.map((action) => ({
+      type: action.type,
+      filePath: action.filePath,
+    }));
+    return { conflicts, decisions };
+  }
+
+  private async executeLocalPlan(
+    actions: SyncAction[],
+    remoteTreeFiles: { [key: string]: GetTreeResponseItem },
+    remoteMetadataFiles: { [key: string]: FileMetadata },
+  ) {
+    await Promise.all([
+      ...actions
+        .filter((action) => action.type === "download")
+        .map(async (action: SyncAction) => {
+          await this.downloadFile(
+            remoteTreeFiles[action.filePath],
+            remoteMetadataFiles[action.filePath]
+              ? remoteMetadataFiles[action.filePath].lastModified
+              : Date.now(),
+          );
+          this.eventsListener.syncWrittenPaths.set(
+            action.filePath,
+            remoteTreeFiles[action.filePath]?.sha ?? null,
+          );
+        }),
+      ...actions
+        .filter((action) => action.type === "delete_local")
+        .map(async (action: SyncAction) => {
+          const meta = this.metadataStore.data.files[action.filePath];
+          if (meta?.deleted) {
+            await this.logger.info(
+              "Skipping delete_local for already deleted metadata entry",
+              action.filePath,
+            );
+            return;
+          }
+          await this.deleteLocalFile(action.filePath);
+        }),
+    ]);
+  }
+
+  private async applyExplicitFolderDeletes(
+    explicitFolderDeletes: ExplicitFolderDelete[],
+  ): Promise<Set<string>> {
+    const removedFolders = new Set<string>();
+
+    for (const folder of explicitFolderDeletes) {
+      const normalizedPath = normalizePath(folder.path);
+      if (!(await this.vault.adapter.exists(normalizedPath))) {
+        removedFolders.add(folder.path);
+        continue;
+      }
+
+      await this.removeDirectoryRecursive(normalizedPath, { force: false });
+      if (!(await this.vault.adapter.exists(normalizedPath))) {
+        removedFolders.add(folder.path);
+      } else {
+        await this.logger.info(
+          "Explicit folder delete preserved remaining descendants",
+          folder.path,
+        );
+      }
+    }
+
+    return removedFolders;
+  }
+
+  private mergeExplicitFolderDeletesIntoLocal(
+    explicitFolderDeletes: ExplicitFolderDelete[],
+  ): boolean {
+    const current = this.sanitizeDeletedFolders(
+      this.metadataStore.data.deletedFolders,
+      this.metadataStore.data.files,
+    );
+    const merged = new Set(current);
+    let changed = false;
+
+    for (const folder of explicitFolderDeletes) {
+      if (!merged.has(folder.path)) {
+        merged.add(folder.path);
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      this.metadataStore.data.deletedFolders = Array.from(merged);
+    }
+
+    return changed;
+  }
+
+  private buildInitialCommitTree(
+    treeFiles: { [key: string]: GetTreeResponseItem },
+  ): { [key: string]: NewTreeRequestItem } {
+    return Object.keys(treeFiles)
+      .map((filePath: string) => ({
+        path: treeFiles[filePath].path,
+        mode: treeFiles[filePath].mode,
+        type: treeFiles[filePath].type,
+        sha: treeFiles[filePath].sha,
+      }))
+      .reduce(
+        (
+          acc: { [key: string]: NewTreeRequestItem },
+          item: NewTreeRequestItem,
+        ) => ({ ...acc, [item.path]: item }),
+        {},
+      );
+  }
+
+  private async commitRemotePlan(plan: CommitPlan) {
+    await Promise.all(
+      plan.actions.map(async (action) => {
+        switch (action.type) {
+          case "upload": {
+            const normalizedPath = normalizePath(action.filePath);
+            if (!(await this.vault.adapter.exists(normalizedPath))) {
+              await this.logger.warn(
+                "Skipping upload for missing file",
+                action.filePath,
+              );
+              break;
+            }
+            const resolution = plan.conflictResolutions.find(
+              (item) => item.filePath === action.filePath,
+            );
+            let content = resolution?.content;
+            if (!content) {
+              content = hasTextExtension(normalizedPath)
+                ? await this.vault.adapter.read(normalizedPath)
+                : "binaryfile";
+            }
+            plan.treeFiles[action.filePath] = {
+              path: action.filePath,
+              mode: "100644",
+              type: "blob",
+              content,
+            };
+            break;
+          }
+          case "delete_remote": {
+            plan.treeFiles[action.filePath] = {
+              path: action.filePath,
+              mode: "100644",
+              type: "blob",
+              sha: null,
+            };
+            break;
+          }
+          case "download":
+          case "delete_local":
+            break;
+        }
+      }),
+    );
+
+    await this.commitSync(
+      plan.treeFiles,
+      plan.baseTreeSha,
+      plan.conflictResolutions,
+      plan.expectedHeadSha,
+    );
   }
 
   /**
@@ -535,111 +1022,15 @@ export default class SyncManager {
     // a commit and we must re-sync from scratch to avoid dropping files.
     const initialHeadSha = await this.client.getBranchHeadSha({ retry: true });
 
-    const { files, sha: treeSha } = await this.client.getRepoContent({
-      retry: true,
-    });
-    const manifest = files[`${this.vault.configDir}/${MANIFEST_FILE_NAME}`];
-
-    if (
-      Object.keys(files).contains(`${this.vault.configDir}/${LOG_FILE_NAME}`)
-    ) {
-      // We don't want to download the log file if the user synced it in the past.
-      // This is necessary because in the past we forgot to ignore the log file
-      // from syncing if the user enabled configs sync.
-      // To avoid downloading it we delete it if still around.
-      delete files[`${this.vault.configDir}/${LOG_FILE_NAME}`];
-    }
-
-    let remoteMetadata: Metadata;
-    let metadataChanged = false;
-
-    if (manifest === undefined) {
-      // Remote manifest is missing — create a synthetic one from the tree.
-      // This happens when files were added to the repo outside of this plugin.
-      await this.logger.warn(
-        "Remote manifest missing, creating from tree state",
-        { fileCount: Object.keys(files).length },
-      );
-      new Notice(
-        "No sync manifest found. Creating one from current repo state. Some sync history may be lost.",
-      );
-      remoteMetadata = { lastSync: 0, files: {} };
-      Object.keys(files).forEach((filePath: string) => {
-        if (this.shouldSkipSyncPath(filePath)) return;
-        remoteMetadata.files[filePath] = {
-          path: filePath,
-          sha: files[filePath].sha,
-          dirty: false,
-          justDownloaded: false,
-          lastModified: Date.now(),
-        };
-      });
-      metadataChanged = true;
-    } else {
-      const blob = await this.client.getBlob({ sha: manifest.sha });
-      remoteMetadata = JSON.parse(decodeBase64String(blob.content));
-      if (!remoteMetadata.files) {
-        remoteMetadata.files = {};
-      }
-    }
-
-    const removedEntries = await this.cleanupUntrackableMetadataEntries();
-    if (removedEntries > 0) {
-      metadataChanged = true;
-    }
-
-    const reconciledEntries = await this.reconcileMissingLocalMetadataEntries();
-    if (reconciledEntries > 0) {
-      metadataChanged = true;
-    }
-
-    // Reconcile remote metadata with the actual remote tree state to support
-    // changes made outside of this plugin (PRs/direct commits/other tools).
-    Object.keys(files).forEach((filePath: string) => {
-      if (this.shouldSkipSyncPath(filePath)) {
-        return;
-      }
-      const treeFile = files[filePath];
-      const metadataFile = remoteMetadata.files[filePath];
-      if (metadataFile) {
-        if (metadataFile.sha !== treeFile.sha) {
-          metadataFile.lastModified = Date.now();
-        }
-        metadataFile.sha = treeFile.sha;
-        if (metadataFile.deleted) {
-          metadataFile.deleted = false;
-          delete metadataFile.deletedAt;
-        }
-      } else {
-        remoteMetadata.files[filePath] = {
-          path: filePath,
-          sha: treeFile.sha,
-          dirty: false,
-          justDownloaded: false,
-          lastModified: Date.now(),
-        };
-      }
-    });
-
-    Object.keys(remoteMetadata.files).forEach((filePath: string) => {
-      if (this.shouldSkipSyncPath(filePath)) {
-        return;
-      }
-      if (!files[filePath] && !remoteMetadata.files[filePath].deleted) {
-        remoteMetadata.files[filePath].deleted = true;
-        remoteMetadata.files[filePath].deletedAt = Date.now();
-      }
-    });
-
-    const hydratedEntries = await this.hydrateMissingBaselines(
-      files,
-      remoteMetadata.files,
+    const remoteSnapshot = await this.buildRemoteSnapshot();
+    const localSnapshot = await this.buildLocalSnapshot(remoteSnapshot);
+    const { conflicts, decisions } = await this.planReconciliation(
+      remoteSnapshot.metadata.files,
+      this.metadataStore.data.files,
     );
-    if (hydratedEntries > 0) {
-      metadataChanged = true;
-    }
-
-    const conflicts = await this.findConflicts(remoteMetadata.files);
+    const mergedRemoteFolderDeletes = this.mergeExplicitFolderDeletesIntoLocal(
+      remoteSnapshot.explicitFolderDeletes,
+    );
 
     // We treat every resolved conflict as an upload SyncAction, mainly cause
     // the user has complete freedom on the edits they can apply to the conflicting files.
@@ -706,115 +1097,37 @@ export default class SyncManager {
     }
 
     const actions: SyncAction[] = [
-      ...(await this.determineSyncActions(
-        remoteMetadata.files,
-        this.metadataStore.data.files,
-        conflictActions.map((action) => action.filePath),
-      )),
+      ...decisions
+        .filter((decision) => decision.type !== "noop" && decision.type !== "conflict")
+        .map((decision) => ({
+          type: decision.type as SyncAction["type"],
+          filePath: decision.filePath,
+        })),
       ...conflictActions,
     ];
 
-    // Handle remote files not present in either metadata store.
-    // If the file also doesn't exist locally, it's an orphan from a deleted
-    // folder — remove it from remote. Otherwise, download it.
-    await Promise.all(
-      Object.keys(files).map(async (filePath: string) => {
-        if (this.shouldSkipSyncPath(filePath)) {
-          return;
-        }
-        if (
-          !remoteMetadata.files[filePath] &&
-          !this.metadataStore.data.files[filePath] &&
-          !actions.find((action) => action.filePath === filePath)
-        ) {
-          const existsLocally = await this.vault.adapter.exists(
-            normalizePath(filePath),
-          );
-          if (existsLocally) {
-            actions.push({ type: "download", filePath });
-          } else {
-            // Orphan file on remote — not tracked, not on local disk.
-            // Delete it from remote to keep the repo clean.
-            actions.push({ type: "delete_remote", filePath });
-            await this.logger.info("Cleaning up orphan remote file", filePath);
-          }
-        }
-      }),
-    );
-
-    const newTreeFiles: { [key: string]: NewTreeRequestItem } = Object.keys(
-      files,
-    )
-      .map((filePath: string) => ({
-        path: files[filePath].path,
-        mode: files[filePath].mode,
-        type: files[filePath].type,
-        sha: files[filePath].sha,
-      }))
-      .reduce(
-        (
-          acc: { [key: string]: NewTreeRequestItem },
-          item: NewTreeRequestItem,
-        ) => ({ ...acc, [item.path]: item }),
-        {},
-      );
-
-    // Process deletedFolders from remote manifest BEFORE the early-return
-    // check. The receiving device (e.g. mobile) may have no file actions but
-    // still needs to remove folders that were deleted on the sending device.
-    remoteMetadata.deletedFolders = this.sanitizeDeletedFolders(
-      remoteMetadata.deletedFolders,
-      remoteMetadata.files,
-    );
-    const hasRemoteDeletedFolders = remoteMetadata.deletedFolders.length > 0;
-
-    // Track folders this device confirmed it deleted during this sync cycle.
-    // Only confirmed deletions are removed from the remote manifest snapshot.
-    // Remote entries for folders that don't exist on this device pass through
-    // unchanged so other devices can still process them.
-    const confirmedDeletedFolders = new Set<string>();
-
-    if (hasRemoteDeletedFolders) {
-      await this.logger.info(
-        "Processing remote deletedFolders",
-        remoteMetadata.deletedFolders,
-      );
-
-      // DO NOT merge remote entries into local metadata. Local only holds
-      // tombstones for folders deleted on THIS device (via events-listener).
-      // Attempt force-delete on folders that exist on this device.
-      for (const folderPath of remoteMetadata.deletedFolders!) {
-        const normalizedDir = normalizePath(folderPath);
-        if (await this.vault.adapter.exists(normalizedDir)) {
-          await this.removeDirectoryRecursive(normalizedDir, { force: true });
-          if (!(await this.vault.adapter.exists(normalizedDir))) {
-            confirmedDeletedFolders.add(folderPath);
-            await this.logger.info("Confirmed folder deletion", folderPath);
-          }
-        }
-      }
-    }
-
-    // hasDeletedFolders only reflects LOCAL entries (folders deleted on THIS device)
-    const hasDeletedFolders =
-      this.metadataStore.data.deletedFolders &&
-      this.metadataStore.data.deletedFolders.length > 0;
-    const didConfirmDeletions = confirmedDeletedFolders.size > 0;
-
     if (actions.length === 0) {
-      if (metadataChanged || hasDeletedFolders || didConfirmDeletions) {
+      await this.applyExplicitFolderDeletes(remoteSnapshot.explicitFolderDeletes);
+      if (
+        remoteSnapshot.metadataChanged ||
+        localSnapshot.metadataChanged ||
+        mergedRemoteFolderDeletes
+      ) {
         await this.logger.info(
           "No file actions to sync, committing metadata updates only",
-          { metadataChanged, hasDeletedFolders, didConfirmDeletions },
+          {
+            remoteMetadataChanged: remoteSnapshot.metadataChanged,
+            localMetadataChanged: localSnapshot.metadataChanged,
+            mergedRemoteFolderDeletes,
+          },
         );
-        await this.commitSync(
-          newTreeFiles,
-          treeSha,
-          [],
-          initialHeadSha,
-          remoteMetadata.deletedFolders,
-          confirmedDeletedFolders,
-        );
+        await this.commitRemotePlan({
+          actions: [],
+          baseTreeSha: remoteSnapshot.treeSha,
+          expectedHeadSha: initialHeadSha,
+          conflictResolutions: [],
+          treeFiles: this.buildInitialCommitTree(remoteSnapshot.treeFiles),
+        });
         return;
       }
       // Nothing to sync
@@ -823,109 +1136,20 @@ export default class SyncManager {
     }
     await this.logger.info("Actions to sync", actions);
 
-    await Promise.all(
-      actions.map(async (action) => {
-        switch (action.type) {
-          case "upload": {
-            const normalizedPath = normalizePath(action.filePath);
-            // Skip files that no longer exist on disk (ghost metadata entries)
-            if (!(await this.vault.adapter.exists(normalizedPath))) {
-              await this.logger.warn(
-                "Skipping upload for missing file",
-                action.filePath,
-              );
-              break;
-            }
-            const resolution = conflictResolutions.find(
-              (c: ConflictResolution) => c.filePath === action.filePath,
-            );
-            // If the file was conflicting we need to read the content from the
-            // conflict resolution instead of reading it from file since at this point
-            // we still have not updated the local file.
-            let content = resolution?.content;
-            if (!content) {
-              // Keep binary files out of text read path. commitSync() will upload
-              // the binary blob from readBinary() based on extension checks.
-              content = hasTextExtension(normalizedPath)
-                ? await this.vault.adapter.read(normalizedPath)
-                : "binaryfile";
-            }
-            newTreeFiles[action.filePath] = {
-              path: action.filePath,
-              mode: "100644",
-              type: "blob",
-              content: content,
-            };
-            break;
-          }
-          case "delete_remote": {
-            newTreeFiles[action.filePath].sha = null;
-            break;
-          }
-          case "download":
-            break;
-          case "delete_local":
-            break;
-        }
-      }),
+    await this.executeLocalPlan(
+      actions,
+      remoteSnapshot.treeFiles,
+      remoteSnapshot.metadata.files,
     );
+    await this.applyExplicitFolderDeletes(remoteSnapshot.explicitFolderDeletes);
 
-    // Download files and delete local files.
-    // Track written paths so the event listener can distinguish sync writes from user edits.
-    await Promise.all([
-      ...actions
-        .filter((action) => action.type === "download")
-        .map(async (action: SyncAction) => {
-          await this.downloadFile(
-            files[action.filePath],
-            remoteMetadata.files[action.filePath]
-              ? remoteMetadata.files[action.filePath].lastModified
-              : Date.now(),
-          );
-          this.eventsListener.syncWrittenPaths.set(
-            action.filePath,
-            files[action.filePath]?.sha ?? null,
-          );
-        }),
-      ...actions
-        .filter((action) => action.type === "delete_local")
-        .map(async (action: SyncAction) => {
-          const meta = this.metadataStore.data.files[action.filePath];
-          if (meta?.deleted) {
-            await this.logger.info(
-              "Skipping delete_local for already deleted metadata entry",
-              action.filePath,
-            );
-            return;
-          }
-          await this.deleteLocalFile(action.filePath);
-        }),
-    ]);
-
-    // Retry folder removal after file actions. The first pass (before
-    // early-return) may have found folders non-empty because delete_local
-    // actions hadn't run yet. Now that files are deleted, retry.
-    if (hasRemoteDeletedFolders) {
-      for (const folderPath of remoteMetadata.deletedFolders!) {
-        const normalizedDir = normalizePath(folderPath);
-        if (await this.vault.adapter.exists(normalizedDir)) {
-          await this.removeDirectoryRecursive(normalizedDir, { force: true });
-          if (!(await this.vault.adapter.exists(normalizedDir))) {
-            confirmedDeletedFolders.add(folderPath);
-            await this.logger.info("Confirmed folder deletion", folderPath);
-          }
-        }
-      }
-    }
-
-    await this.commitSync(
-      newTreeFiles,
-      treeSha,
+    await this.commitRemotePlan({
+      actions,
+      baseTreeSha: remoteSnapshot.treeSha,
+      expectedHeadSha: initialHeadSha,
       conflictResolutions,
-      initialHeadSha,
-      remoteMetadata.deletedFolders,
-      confirmedDeletedFolders,
-    );
+      treeFiles: this.buildInitialCommitTree(remoteSnapshot.treeFiles),
+    });
   }
 
   /**
@@ -1032,9 +1256,27 @@ export default class SyncManager {
   async findConflicts(filesMetadata: {
     [key: string]: FileMetadata;
   }): Promise<ConflictFile[]> {
-    const commonFiles = Object.keys(filesMetadata).filter(
-      (key) => key in this.metadataStore.data.files,
+    const pathStates = await this.buildPathStates(
+      filesMetadata,
+      Object.fromEntries(
+        Object.entries(filesMetadata)
+          .filter(([, file]) => file.sha !== null)
+          .map(([filePath, file]) => [
+            filePath,
+            {
+              path: filePath,
+              mode: "100644",
+              type: "blob",
+              sha: file.sha!,
+              size: 0,
+              url: "",
+            } satisfies GetTreeResponseItem,
+          ]),
+      ),
+      this.metadataStore.data.files,
     );
+
+    const commonFiles = Object.keys(pathStates);
     if (commonFiles.length === 0) {
       return [];
     }
@@ -1046,18 +1288,23 @@ export default class SyncManager {
           // handle conflicts for this
           return null;
         }
-        const remoteFile = filesMetadata[filePath];
-        const localFile = this.metadataStore.data.files[filePath];
+        const state = pathStates[filePath];
+        const remoteFile = state.remoteMetadata;
+        const localFile = state.localMetadata;
+        if (!remoteFile || !localFile) {
+          return null;
+        }
         if (remoteFile.deleted && localFile.deleted) {
           return null;
         }
-        if (localFile.sha === null || remoteFile.sha === null) {
-          // Missing baseline means we cannot perform trusted 3-way conflict detection.
-          return null;
-        }
-        const actualLocalSHA = await this.calculateSHA(filePath);
+        const actualLocalSHA = state.actualLocalSha;
         if (actualLocalSHA === null) {
           return null;
+        }
+        if (localFile.sha === null || remoteFile.sha === null) {
+          return remoteFile.deleted || remoteFile.sha === actualLocalSHA
+            ? null
+            : filePath;
         }
         const remoteFileHasBeenModifiedSinceLastSync =
           remoteFile.sha !== localFile.sha;
@@ -1138,6 +1385,77 @@ export default class SyncManager {
     );
   }
 
+  private reconcilePath(
+    pathState: PathState,
+    conflictFiles: Set<string>,
+  ): ReconcileDecision {
+    const filePath = pathState.path;
+    if (
+      filePath === `${this.vault.configDir}/${MANIFEST_FILE_NAME}` ||
+      this.shouldSkipSyncPath(filePath)
+    ) {
+      return { type: "noop", filePath };
+    }
+    if (conflictFiles.has(filePath)) {
+      return { type: "conflict", filePath };
+    }
+
+    const remoteFile = pathState.remoteMetadata;
+    const localFile = pathState.localMetadata;
+    const localSHA = pathState.actualLocalSha;
+
+    if (remoteFile && localFile) {
+      if (remoteFile.deleted && localFile.deleted) {
+        return { type: "noop", filePath };
+      }
+
+      if (remoteFile.deleted && !localFile.deleted) {
+        const localWasEdited = localSHA !== null && localSHA !== localFile.sha;
+        if (localWasEdited) {
+          new Notice(
+            `'${filePath.split("/").pop()}' was deleted on another device but has local edits. Kept the local version.`,
+          );
+          return { type: "upload", filePath };
+        }
+        return { type: "delete_local", filePath };
+      }
+
+      if (!remoteFile.deleted && localFile.deleted) {
+        const remoteWasEdited =
+          localFile.sha !== null && remoteFile.sha !== localFile.sha;
+        if (remoteWasEdited) {
+          new Notice(
+            `'${filePath.split("/").pop()}' was deleted locally but has remote edits. Restored the remote version.`,
+          );
+          return { type: "download", filePath };
+        }
+        return { type: "delete_remote", filePath };
+      }
+
+      if (remoteFile.sha === localSHA) {
+        return { type: "noop", filePath };
+      }
+
+      return localSHA !== localFile.sha
+        ? { type: "upload", filePath }
+        : { type: "download", filePath };
+    }
+
+    if (remoteFile && !localFile) {
+      return remoteFile.deleted
+        ? { type: "noop", filePath }
+        : { type: "download", filePath };
+    }
+
+    if (!remoteFile && localFile) {
+      return localFile.deleted
+        ? { type: "noop", filePath }
+        : { type: "upload", filePath };
+    }
+
+    return { type: "noop", filePath };
+  }
+
   /**
    * Determines which sync action to take for each file.
    *
@@ -1152,124 +1470,17 @@ export default class SyncManager {
     localFiles: { [key: string]: FileMetadata },
     conflictFiles: string[],
   ) {
-    let actions: SyncAction[] = [];
-
-    const commonFiles = Object.keys(remoteFiles)
-      .filter((filePath) => filePath in localFiles)
-      // Remove conflicting files, we determine their actions in a different way
-      .filter((filePath) => !conflictFiles.contains(filePath))
-      .filter((filePath) => !this.shouldSkipSyncPath(filePath));
-
-    // Get diff for common files
-    await Promise.all(
-      commonFiles.map(async (filePath: string) => {
-        if (filePath === `${this.vault.configDir}/${MANIFEST_FILE_NAME}`) {
-          // The manifest file must never trigger any action
-          return;
-        }
-
-        const remoteFile = remoteFiles[filePath];
-        const localFile = localFiles[filePath];
-        if (remoteFile.deleted && localFile.deleted) {
-          // Nothing to do
-          return;
-        }
-
-        const localSHA = await this.calculateSHA(filePath);
-
-        if (remoteFile.deleted && !localFile.deleted) {
-          // Remote deleted this file. Check if local was actually edited
-          // since last sync — if so, the edit wins and we re-upload.
-          // If local is unchanged, propagate the delete normally.
-          const localWasEdited = localSHA !== null && localSHA !== localFile.sha;
-          if (localWasEdited) {
-            actions.push({ type: "upload", filePath: filePath });
-            new Notice(
-              `'${filePath.split("/").pop()}' was deleted on another device but has local edits. Kept the local version.`,
-            );
-          } else {
-            actions.push({ type: "delete_local", filePath: filePath });
-          }
-          return;
-        }
-
-        if (!remoteFile.deleted && localFile.deleted) {
-          // Local deleted this file. Check if remote was actually edited
-          // since last sync — if so, the edit wins and we download.
-          // If remote is unchanged, propagate the delete normally.
-          const remoteWasEdited =
-            localFile.sha !== null && remoteFile.sha !== localFile.sha;
-          if (remoteWasEdited) {
-            actions.push({ type: "download", filePath: filePath });
-            new Notice(
-              `'${filePath.split("/").pop()}' was deleted locally but has remote edits. Restored the remote version.`,
-            );
-          } else {
-            actions.push({ type: "delete_remote", filePath: filePath });
-          }
-          return;
-        }
-
-        if (remoteFile.sha === localSHA) {
-          // If the remote file sha is identical to the actual sha of the local file
-          // there are no actions to take.
-          // We calculate the SHA at the moment instead of using the one stored in the
-          // metadata file cause we update that only when the file is uploaded or downloaded.
-          return;
-        }
-
-        // For non-deletion cases, if SHAs differ, we just need to check if local changed.
-        // Conflicts are already filtered out so we can make this decision easily
-        if (localSHA !== localFile.sha) {
-          actions.push({ type: "upload", filePath: filePath });
-          return;
-        } else {
-          actions.push({ type: "download", filePath: filePath });
-          return;
-        }
-      }),
-    );
-
-    // Get diff for files in remote but not in local
-    Object.keys(remoteFiles).forEach((filePath: string) => {
-      if (this.shouldSkipSyncPath(filePath)) {
-        return;
-      }
-      const remoteFile = remoteFiles[filePath];
-      const localFile = localFiles[filePath];
-      if (localFile) {
-        // Local file exists, we already handled it.
-        // Skip it.
-        return;
-      }
-      if (remoteFile.deleted) {
-        // Remote is deleted but we don't have it locally.
-        // Nothing to do.
-        // TODO: Maybe we need to remove remote reference too?
-      } else {
-        actions.push({ type: "download", filePath: filePath });
-      }
-    });
-
-    // Get diff for files in local but not in remote
-    Object.keys(localFiles).forEach((filePath: string) => {
-      if (this.shouldSkipSyncPath(filePath)) {
-        return;
-      }
-      const remoteFile = remoteFiles[filePath];
-      const localFile = localFiles[filePath];
-      if (remoteFile) {
-        // Remote file exists, we already handled it.
-        // Skip it.
-        return;
-      }
-      if (localFile.deleted) {
-        // Local is deleted and remote doesn't exist.
-        // Just remove the local reference.
-      } else {
-        actions.push({ type: "upload", filePath: filePath });
-      }
-    });
+    const pathStates = await this.buildPathStates(remoteFiles, {}, localFiles);
+    const conflicts = new Set(conflictFiles);
+    const actions = Object.values(pathStates)
+      .map((state) => this.reconcilePath(state, conflicts))
+      .filter(
+        (decision) => decision.type !== "noop" && decision.type !== "conflict",
+      )
+      .map((decision) => ({
+        type: decision.type as SyncAction["type"],
+        filePath: decision.filePath,
+      }));
 
     if (!this.settings.syncConfigDir) {
       // Remove all actions that involve the config directory if the user doesn't want to sync it.
@@ -1336,8 +1547,6 @@ export default class SyncManager {
     baseTreeSha: string,
     conflictResolutions: ConflictResolution[] = [],
     expectedHeadSha?: string,
-    remoteDeletedFolders?: string[],
-    confirmedDeletedFolders?: Set<string>,
   ) {
     // Sync timestamp — used for manifest snapshot but NOT applied to live
     // metadataStore until after commit succeeds (deferred writes pattern).
@@ -1393,29 +1602,18 @@ export default class SyncManager {
         manifestSnapshot.files[resolution.filePath].lastModified = syncTime;
       }
     });
-
-    // Build snapshot deletedFolders from three sources:
-    // 1. Local entries (folders deleted on THIS device)
-    // 2. Remote entries passed through (for other devices)
-    // 3. MINUS entries this device confirmed it deleted this cycle
-    const snapshotDf: string[] = [];
-    if (manifestSnapshot.deletedFolders) {
-      for (const entry of manifestSnapshot.deletedFolders) {
-        if (!snapshotDf.includes(entry)) {
-          snapshotDf.push(entry);
-        }
-      }
-    }
-    if (remoteDeletedFolders) {
-      for (const entry of remoteDeletedFolders) {
-        const wasConfirmed = confirmedDeletedFolders?.has(entry) ?? false;
-        if (!wasConfirmed && !snapshotDf.includes(entry)) {
-          snapshotDf.push(entry);
-        }
-      }
-    }
+    const liveTreeFiles = Object.fromEntries(
+      Object.entries(treeFiles).filter(([, item]) => item.sha !== null || item.content),
+    );
+    const remainingExplicitFolderDeletes = this.filterExplicitFolderDeletes(
+      this.getExplicitFolderDeletes(this.metadataStore.data),
+      manifestSnapshot.files,
+      liveTreeFiles,
+    );
     manifestSnapshot.deletedFolders =
-      snapshotDf.length > 0 ? snapshotDf : undefined;
+      remainingExplicitFolderDeletes.length > 0
+        ? remainingExplicitFolderDeletes.map((folder) => folder.path)
+        : undefined;
 
     // Update manifest in list of new tree items
     delete treeFiles[`${this.vault.configDir}/${MANIFEST_FILE_NAME}`].sha;
@@ -1475,25 +1673,7 @@ export default class SyncManager {
       }),
     );
 
-    // Clean up local deletedFolders. After the fix, local only contains
-    // tombstones for folders deleted on THIS device (via events-listener).
-    // Remote entries are never merged into local — they pass through the
-    // snapshot separately. Drop local entries where the folder no longer
-    // exists (tombstone was already pushed to remote for other devices).
-    if (this.metadataStore.data.deletedFolders) {
-      this.metadataStore.data.deletedFolders = this.sanitizeDeletedFolders(
-        this.metadataStore.data.deletedFolders,
-      );
-      const remaining: string[] = [];
-      for (const folderPath of this.metadataStore.data.deletedFolders) {
-        const normalizedDir = normalizePath(folderPath);
-        const exists = await this.vault.adapter.exists(normalizedDir);
-        if (exists) {
-          remaining.push(folderPath);
-        }
-      }
-      this.metadataStore.data.deletedFolders = remaining;
-    }
+    this.metadataStore.data.deletedFolders = manifestSnapshot.deletedFolders;
 
     // Purge stale tombstones: deleted entries whose parent folder no longer
     // exists locally. These have served their purpose — the deletion has been

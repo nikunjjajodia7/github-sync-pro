@@ -138,6 +138,38 @@ describe("findConflicts", () => {
     expect(conflicts[0].localContent).toBe("local content");
   });
 
+  it("detects conflict when both sides created the same path without a baseline and contents differ", async () => {
+    setLocalMetadata({
+      "note.md": makeFileMetadata("note.md", { sha: null }),
+    });
+    mockCalculateSHA({ "note.md": "local_new_sha" });
+    mockGetBlob("remote content");
+
+    vault._store["note.md"] = "local content";
+
+    const conflicts = await syncManager.findConflicts({
+      "note.md": makeFileMetadata("note.md", { sha: "remote_new_sha" }),
+    });
+
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0].filePath).toBe("note.md");
+    expect(conflicts[0].remoteContent).toBe("remote content");
+    expect(conflicts[0].localContent).toBe("local content");
+  });
+
+  it("does not conflict when both sides created the same path without a baseline and contents match", async () => {
+    setLocalMetadata({
+      "note.md": makeFileMetadata("note.md", { sha: null }),
+    });
+    mockCalculateSHA({ "note.md": "same_new_sha" });
+
+    const conflicts = await syncManager.findConflicts({
+      "note.md": makeFileMetadata("note.md", { sha: "same_new_sha" }),
+    });
+
+    expect(conflicts).toHaveLength(0);
+  });
+
   it("no conflict when both sides changed to same content", async () => {
     const baseSha = "base_sha";
     const sameSha = "same_new_sha";
@@ -198,5 +230,25 @@ describe("findConflicts", () => {
     expect(conflicts[0].filePath).toBe("image.png");
     expect(conflicts[0].remoteContent).toBe("");
     expect(conflicts[0].localContent).toBe("");
+  });
+
+  it("surfaces binary concurrent create as a conflict with empty payloads", async () => {
+    setLocalMetadata({
+      "image.png": makeFileMetadata("image.png", { sha: null }),
+    });
+    mockCalculateSHA({ "image.png": "local_new_sha" });
+
+    vault._store["image.png"] = "fake binary";
+
+    const conflicts = await syncManager.findConflicts({
+      "image.png": makeFileMetadata("image.png", { sha: "remote_new_sha" }),
+    });
+
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0]).toMatchObject({
+      filePath: "image.png",
+      remoteContent: "",
+      localContent: "",
+    });
   });
 });

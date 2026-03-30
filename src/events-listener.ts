@@ -119,16 +119,13 @@ export default class EventsListener {
         await this.logger.warn("Skipped invalid deleted folder event", filePath);
         return;
       }
-      // Track folder deletion so it can be propagated to other devices.
-      // When a user explicitly deletes a folder, this event fires AFTER
-      // the delete events for all files inside it.
       if (!this.metadataStore.data.deletedFolders) {
         this.metadataStore.data.deletedFolders = [];
       }
       if (!this.metadataStore.data.deletedFolders.contains(filePath)) {
         this.metadataStore.data.deletedFolders.push(filePath);
         await this.metadataStore.save();
-        await this.logger.info("Tracked deleted folder", filePath);
+        await this.logger.info("Tracked explicit deleted folder", filePath);
       }
       return;
     }
