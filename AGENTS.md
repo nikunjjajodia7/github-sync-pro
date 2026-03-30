@@ -1,7 +1,7 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **github-sync-pro** (355 symbols, 1022 relationships, 26 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **manama** (427 symbols, 1207 relationships, 30 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
@@ -17,7 +17,7 @@ This project is indexed by GitNexus as **github-sync-pro** (355 symbols, 1022 re
 
 1. `gitnexus_query({query: "<error or symptom>"})` — find execution flows related to the issue
 2. `gitnexus_context({name: "<suspect function>"})` — see all callers, callees, and process participation
-3. `READ gitnexus://repo/github-sync-pro/process/{processName}` — trace the full execution flow step by step
+3. `READ gitnexus://repo/manama/process/{processName}` — trace the full execution flow step by step
 4. For regressions: `gitnexus_detect_changes({scope: "compare", base_ref: "main"})` — see what your branch changed
 
 ## When Refactoring
@@ -56,10 +56,10 @@ This project is indexed by GitNexus as **github-sync-pro** (355 symbols, 1022 re
 
 | Resource | Use for |
 |----------|---------|
-| `gitnexus://repo/github-sync-pro/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/github-sync-pro/clusters` | All functional areas |
-| `gitnexus://repo/github-sync-pro/processes` | All execution flows |
-| `gitnexus://repo/github-sync-pro/process/{name}` | Step-by-step execution trace |
+| `gitnexus://repo/manama/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/manama/clusters` | All functional areas |
+| `gitnexus://repo/manama/processes` | All execution flows |
+| `gitnexus://repo/manama/process/{name}` | Step-by-step execution trace |
 
 ## Self-Check Before Finishing
 
