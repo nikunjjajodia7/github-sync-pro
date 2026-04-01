@@ -3,6 +3,8 @@ import {
   writeFileSync,
   existsSync,
   mkdirSync,
+  readdirSync,
+  statSync,
   promises as fs,
 } from "fs";
 import * as path from "path";
@@ -29,6 +31,47 @@ export class Vault {
 
   getRoot() {
     return { path: this.rootPath };
+  }
+
+  getAbstractFileByPath(filePath: string) {
+    const fullPath = path.join(this.rootPath, filePath);
+    if (!existsSync(fullPath)) {
+      return null;
+    }
+    const stats = statSync(fullPath);
+    if (stats.isDirectory()) {
+      const folder = new TFolder(filePath);
+      (folder as any).children = [];
+      (folder as any).isRoot = () => filePath === "";
+      return folder;
+    }
+    return new TFile(filePath);
+  }
+
+  getAllLoadedFiles() {
+    const loaded: TAbstractFile[] = [];
+    const walk = (relativePath: string) => {
+      const fullPath = path.join(this.rootPath, relativePath);
+      if (!existsSync(fullPath)) {
+        return;
+      }
+      const stats = require("fs").statSync(fullPath);
+      if (stats.isDirectory()) {
+        const folder = new TFolder(relativePath);
+        (folder as any).children = [];
+        (folder as any).isRoot = () => relativePath === "";
+      loaded.push(folder);
+        for (const entry of readdirSync(fullPath)) {
+          const childPath = relativePath ? path.join(relativePath, entry) : entry;
+          walk(childPath);
+        }
+        return;
+      }
+      loaded.push(new TFile(relativePath));
+    };
+
+    walk("");
+    return loaded;
   }
 
   get adapter() {
@@ -64,6 +107,20 @@ export class Vault {
       exists: async (filePath: string) => {
         const fullPath = path.join(this.rootPath, filePath);
         return existsSync(fullPath);
+      },
+
+      stat: async (filePath: string) => {
+        const fullPath = path.join(this.rootPath, filePath);
+        if (!existsSync(fullPath)) {
+          return null;
+        }
+        const stats = await fs.stat(fullPath);
+        return {
+          type: stats.isDirectory() ? "folder" : "file",
+          size: stats.size,
+          ctime: stats.ctimeMs,
+          mtime: stats.mtimeMs,
+        };
       },
 
       mkdir: async (dirPath: string) => {

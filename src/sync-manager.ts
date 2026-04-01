@@ -13,6 +13,7 @@ import GithubClient, {
 import MetadataStore, {
   ExplicitFolderDelete,
   FileMetadata,
+  FolderMetadata,
   Metadata,
   MANIFEST_FILE_NAME,
 } from "./metadata-store";
@@ -63,6 +64,11 @@ interface ReconcileDecision {
   filePath: string;
 }
 
+interface RemoteFolderReconcileResult {
+  createdLocalFolders: string[];
+  metadataChanged: boolean;
+}
+
 interface CommitPlan {
   actions: SyncAction[];
   baseTreeSha: string;
@@ -70,7 +76,9 @@ interface CommitPlan {
   expectedHeadSha: string;
   conflictResolutions: ConflictResolution[];
   remoteDeletedFolders?: string[];
+  remoteFolders?: { [key: string]: FolderMetadata };
   treeFiles: { [key: string]: NewTreeRequestItem };
+  uploadedPaths?: Set<string>;
 }
 
 export interface ConflictFile {
@@ -137,6 +145,16 @@ export default class SyncManager {
     );
   }
 
+  private isFolderLike(value: unknown): value is { path: string } {
+    return (
+      !!value &&
+      typeof value === "object" &&
+      typeof (value as any).path === "string" &&
+      (Array.isArray((value as any).children) ||
+        typeof (value as any).isRoot === "function")
+    );
+  }
+
   private isEnoentError(err: unknown): boolean {
     if (!(err instanceof Error)) {
       return false;
@@ -188,6 +206,198 @@ export default class SyncManager {
     }
 
     return sanitized;
+  }
+
+  private sanitizeFolders(
+    folders?: { [key: string]: FolderMetadata },
+  ): { [key: string]: FolderMetadata } {
+    if (!folders) {
+      return {};
+    }
+
+    const sanitized: { [key: string]: FolderMetadata } = {};
+    for (const [rawPath, meta] of Object.entries(folders)) {
+      const folderPath = normalizePath(meta?.path ?? rawPath ?? "");
+      if (
+        !folderPath ||
+        !isTrackableSyncFolderPath(folderPath, {
+          configDir: this.vault.configDir,
+          syncConfigDir: this.settings.syncConfigDir,
+        })
+      ) {
+        continue;
+      }
+      sanitized[folderPath] = {
+        path: folderPath,
+        deleted: meta?.deleted ?? false,
+        deletedAt: meta?.deletedAt ?? null,
+        lastModified: meta?.lastModified ?? Date.now(),
+      };
+    }
+
+    return sanitized;
+  }
+
+  private getParentFolders(path: string): string[] {
+    const normalizedPath = normalizePath(path);
+    const segments = normalizedPath.split("/");
+    const folders: string[] = [];
+    let current = "";
+
+    for (const segment of segments.slice(0, -1)) {
+      current = current ? `${current}/${segment}` : segment;
+      if (
+        isTrackableSyncFolderPath(current, {
+          configDir: this.vault.configDir,
+          syncConfigDir: this.settings.syncConfigDir,
+        })
+      ) {
+        folders.push(current);
+      }
+    }
+
+    return folders;
+  }
+
+  private getAncestorFolders(folderPath: string): string[] {
+    const normalizedPath = normalizePath(folderPath);
+    const segments = normalizedPath.split("/");
+    const ancestors: string[] = [];
+    let current = "";
+
+    for (const segment of segments) {
+      current = current ? `${current}/${segment}` : segment;
+      if (
+        isTrackableSyncFolderPath(current, {
+          configDir: this.vault.configDir,
+          syncConfigDir: this.settings.syncConfigDir,
+        })
+      ) {
+        ancestors.push(current);
+      }
+    }
+
+    return ancestors;
+  }
+
+  private buildDerivedFolders(
+    metadataFiles: { [key: string]: FileMetadata },
+    existingFolders: { [key: string]: FolderMetadata } = {},
+    deletedFolders: string[] = [],
+  ): { [key: string]: FolderMetadata } {
+    const now = Date.now();
+    const folders = this.sanitizeFolders(existingFolders);
+
+    for (const deletedFolderPath of this.sanitizeDeletedFolders(
+      deletedFolders,
+      metadataFiles,
+    )) {
+      const current = folders[deletedFolderPath];
+      folders[deletedFolderPath] = {
+        path: deletedFolderPath,
+        deleted: true,
+        deletedAt: current?.deletedAt ?? now,
+        lastModified: current?.lastModified ?? now,
+      };
+    }
+
+    for (const meta of Object.values(metadataFiles)) {
+      if (meta.deleted) {
+        continue;
+      }
+      for (const folderPath of this.getParentFolders(meta.path)) {
+        const current = folders[folderPath];
+        folders[folderPath] = {
+          path: folderPath,
+          deleted: false,
+          deletedAt: null,
+          lastModified: current?.lastModified ?? now,
+        };
+      }
+    }
+
+    for (const folder of Object.values({ ...folders })) {
+      if (folder.deleted) {
+        continue;
+      }
+      for (const ancestorPath of this.getAncestorFolders(folder.path)) {
+        const current = folders[ancestorPath];
+        folders[ancestorPath] = {
+          path: ancestorPath,
+          deleted: false,
+          deletedAt: null,
+          lastModified: current?.lastModified ?? folder.lastModified ?? now,
+        };
+      }
+    }
+
+    for (const [folderPath, folder] of Object.entries(folders)) {
+      if (!folder.deleted) {
+        continue;
+      }
+      const hasLiveFileDescendant = Object.values(metadataFiles).some(
+        (meta) => !meta.deleted && meta.path.startsWith(`${folderPath}/`),
+      );
+      const hasLiveFolderDescendant = Object.values(folders).some(
+        (candidate) =>
+          candidate.path !== folderPath &&
+          !candidate.deleted &&
+          candidate.path.startsWith(`${folderPath}/`),
+      );
+      if (hasLiveFileDescendant || hasLiveFolderDescendant) {
+        folders[folderPath] = {
+          ...folder,
+          deleted: false,
+          deletedAt: null,
+        };
+      }
+    }
+
+    return folders;
+  }
+
+  private buildLegacyDeletedFolders(
+    folders: { [key: string]: FolderMetadata },
+    metadataFiles: { [key: string]: FileMetadata },
+    treeFiles: { [key: string]: { path?: string } },
+  ): string[] {
+    const deletedEntries = Object.values(folders)
+      .filter((folder) => folder.deleted)
+      .map((folder) => ({
+        path: folder.path,
+        deletedAt: folder.deletedAt ?? null,
+      }));
+
+    return this.filterExplicitFolderDeletes(
+      deletedEntries,
+      metadataFiles,
+      treeFiles,
+    ).map((folder) => folder.path);
+  }
+
+  private buildFolderSyncState(
+    folders: { [key: string]: FolderMetadata } = {},
+  ): { [path: string]: { deleted: boolean } } {
+    return Object.fromEntries(
+      Object.entries(this.sanitizeFolders(folders))
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([folderPath, folder]) => [
+          folderPath,
+          {
+            deleted: folder.deleted ?? false,
+          },
+        ]),
+    );
+  }
+
+  private hasFolderStateDiff(
+    localFolders: { [key: string]: FolderMetadata } = {},
+    remoteFolders: { [key: string]: FolderMetadata } = {},
+  ): boolean {
+    return (
+      JSON.stringify(this.buildFolderSyncState(localFolders)) !==
+      JSON.stringify(this.buildFolderSyncState(remoteFolders))
+    );
   }
 
   private getExplicitFolderDeletes(metadata: Metadata): ExplicitFolderDelete[] {
@@ -347,6 +557,11 @@ export default class SyncManager {
         remoteMetadata.files = {};
       }
     }
+    remoteMetadata.folders = this.buildDerivedFolders(
+      remoteMetadata.files,
+      remoteMetadata.folders,
+      remoteMetadata.deletedFolders,
+    );
 
     const {
       explicitFolderDeletes,
@@ -413,6 +628,13 @@ export default class SyncManager {
   ): Promise<LocalSnapshot> {
     let metadataChanged = false;
 
+    await this.adoptMissingLocalFolderMetadataEntries();
+
+    const adoptedFiles = await this.adoptMissingLocalFileMetadataEntries();
+    if (adoptedFiles > 0) {
+      metadataChanged = true;
+    }
+
     const removedEntries = await this.cleanupUntrackableMetadataEntries();
     if (removedEntries > 0) {
       metadataChanged = true;
@@ -439,6 +661,187 @@ export default class SyncManager {
         this.metadataStore.data.files,
       ),
     };
+  }
+
+  private async listLocalTrackablePaths(): Promise<{
+    files: string[];
+    folders: string[];
+  }> {
+    const files = new Set<string>();
+    const folders = new Set<string>();
+    const pending = [this.vault.getRoot().path];
+
+    while (pending.length > 0) {
+      const folder = pending.pop();
+      if (folder === undefined) {
+        continue;
+      }
+      if (!this.settings.syncConfigDir && folder === this.vault.configDir) {
+        continue;
+      }
+
+      const res = await this.vault.adapter.list(folder);
+      for (const childFolder of res.folders) {
+        if (
+          isTrackableSyncFolderPath(childFolder, {
+            configDir: this.vault.configDir,
+            syncConfigDir: this.settings.syncConfigDir,
+          })
+        ) {
+          folders.add(childFolder);
+        }
+        pending.push(childFolder);
+      }
+      for (const filePath of res.files) {
+        if (this.isTrackablePath(filePath, false)) {
+          files.add(filePath);
+        }
+      }
+    }
+
+    const loadedFiles = (this.vault as any).getAllLoadedFiles?.();
+    if (Array.isArray(loadedFiles)) {
+      for (const entry of loadedFiles) {
+        if (!this.isFolderLike(entry)) {
+          continue;
+        }
+        const folderPath = normalizePath(entry.path);
+        if (
+          isTrackableSyncFolderPath(folderPath, {
+            configDir: this.vault.configDir,
+            syncConfigDir: this.settings.syncConfigDir,
+          })
+        ) {
+          folders.add(folderPath);
+        }
+      }
+    }
+
+    for (const folderPath of await this.listFilesystemTrackableFolders()) {
+      folders.add(folderPath);
+    }
+
+    return { files: Array.from(files), folders: Array.from(folders) };
+  }
+
+  private async listFilesystemTrackableFolders(): Promise<string[]> {
+    const basePath = (this.vault.adapter as any).getBasePath?.();
+    if (!basePath) {
+      return [];
+    }
+
+    try {
+      const req =
+        (globalThis as any).require ??
+        (typeof require === "function" ? require : null);
+      if (!req) {
+        return [];
+      }
+      const fs: any = req("fs");
+      const path: any = req("path");
+      const folders = new Set<string>();
+      const pending = [""];
+
+      while (pending.length > 0) {
+        const relativePath = pending.pop();
+        if (relativePath === undefined) {
+          continue;
+        }
+
+        const absolutePath = relativePath
+          ? path.join(basePath, relativePath)
+          : basePath;
+        let entries: any[];
+        try {
+          entries = fs.readdirSync(absolutePath, { withFileTypes: true });
+        } catch {
+          continue;
+        }
+
+        for (const entry of entries) {
+          if (!entry.isDirectory()) {
+            continue;
+          }
+
+          const childPath = normalizePath(
+            relativePath
+              ? path.join(relativePath, String(entry.name))
+              : String(entry.name),
+          );
+          pending.push(childPath);
+          if (
+            isTrackableSyncFolderPath(childPath, {
+              configDir: this.vault.configDir,
+              syncConfigDir: this.settings.syncConfigDir,
+            })
+          ) {
+            folders.add(childPath);
+          }
+        }
+      }
+
+      return Array.from(folders);
+    } catch {
+      return [];
+    }
+  }
+
+  private async adoptMissingLocalFileMetadataEntries(): Promise<number> {
+    const { files } = await this.listLocalTrackablePaths();
+    const adoptedPaths: string[] = [];
+
+    for (const filePath of files) {
+      if (this.metadataStore.data.files[filePath]) {
+        continue;
+      }
+      this.metadataStore.data.files[filePath] = {
+        path: filePath,
+        sha: null,
+        dirty: true,
+        justDownloaded: false,
+        lastModified: Date.now(),
+      };
+      adoptedPaths.push(filePath);
+    }
+
+    if (adoptedPaths.length > 0) {
+      await this.metadataStore.save();
+      await this.logger.warn("Adopted missing local file metadata entries", {
+        count: adoptedPaths.length,
+        sample: adoptedPaths.slice(0, 5),
+      });
+    }
+
+    return adoptedPaths.length;
+  }
+
+  private async adoptMissingLocalFolderMetadataEntries(): Promise<number> {
+    this.metadataStore.data.folders ??= {};
+    const { folders } = await this.listLocalTrackablePaths();
+    const adoptedPaths: string[] = [];
+
+    for (const folderPath of folders) {
+      if (this.metadataStore.data.folders[folderPath]) {
+        continue;
+      }
+      this.metadataStore.data.folders[folderPath] = {
+        path: folderPath,
+        deleted: false,
+        deletedAt: null,
+        lastModified: Date.now(),
+      };
+      adoptedPaths.push(folderPath);
+    }
+
+    if (adoptedPaths.length > 0) {
+      await this.metadataStore.save();
+      await this.logger.warn("Adopted missing local folder metadata entries", {
+        count: adoptedPaths.length,
+        sample: adoptedPaths.slice(0, 5),
+      });
+    }
+
+    return adoptedPaths.length;
   }
 
   private async buildPathStates(
@@ -557,32 +960,83 @@ export default class SyncManager {
     return removedFolders;
   }
 
+  private async ensureLocalFolderExists(folderPath: string) {
+    const ancestors = this.getAncestorFolders(folderPath);
+    for (const ancestorPath of ancestors) {
+      if (!(await this.vault.adapter.exists(ancestorPath))) {
+        await this.vault.adapter.mkdir(ancestorPath);
+      }
+    }
+  }
+
+  private async reconcileRemoteFolders(
+    remoteFolders: { [key: string]: FolderMetadata },
+  ): Promise<RemoteFolderReconcileResult> {
+    const createdLocalFolders: string[] = [];
+    let metadataChanged = false;
+    this.metadataStore.data.folders ??= {};
+    const locallyDeletedFolders = new Set(
+      this.sanitizeDeletedFolders(
+        this.metadataStore.data.deletedFolders,
+        this.metadataStore.data.files,
+      ),
+    );
+
+    for (const folder of Object.values(remoteFolders)) {
+      if (folder.deleted) {
+        continue;
+      }
+      if (
+        locallyDeletedFolders.has(folder.path) ||
+        this.metadataStore.data.folders[folder.path]?.deleted
+      ) {
+        continue;
+      }
+
+      if (!(await this.vault.adapter.exists(folder.path))) {
+        await this.ensureLocalFolderExists(folder.path);
+        createdLocalFolders.push(folder.path);
+      }
+
+      if (!this.metadataStore.data.folders[folder.path]) {
+        this.metadataStore.data.folders[folder.path] = {
+          path: folder.path,
+          deleted: false,
+          deletedAt: null,
+          lastModified: folder.lastModified ?? Date.now(),
+        };
+        metadataChanged = true;
+      }
+    }
+
+    if (metadataChanged) {
+      await this.metadataStore.save();
+    }
+
+    return { createdLocalFolders, metadataChanged };
+  }
+
   private buildManifestDeletedFolders(
     metadataFiles: { [key: string]: FileMetadata },
     treeFiles: { [key: string]: { path?: string } },
     remoteDeletedFolders: string[] = [],
     confirmedDeletedFolders: Set<string> = new Set(),
   ): string[] {
-    const pendingFolders = [
-      ...this.sanitizeDeletedFolders(
-        this.metadataStore.data.deletedFolders,
-        this.metadataStore.data.files,
-      ),
-      ...remoteDeletedFolders.filter(
-        (folderPath) => !confirmedDeletedFolders.has(folderPath),
-      ),
-    ];
-
-    const uniqueFolders = Array.from(new Set(pendingFolders)).map((folderPath) => ({
-      path: folderPath,
-      deletedAt: null,
-    }));
-
-    return this.filterExplicitFolderDeletes(
-      uniqueFolders,
+    const nextFolders = this.buildDerivedFolders(
       metadataFiles,
-      treeFiles,
-    ).map((folder) => folder.path);
+      this.metadataStore.data.folders,
+      [
+        ...this.sanitizeDeletedFolders(
+          this.metadataStore.data.deletedFolders,
+          this.metadataStore.data.files,
+        ),
+        ...remoteDeletedFolders.filter(
+          (folderPath) => !confirmedDeletedFolders.has(folderPath),
+        ),
+      ],
+    );
+
+    return this.buildLegacyDeletedFolders(nextFolders, metadataFiles, treeFiles);
   }
 
   private buildInitialCommitTree(
@@ -650,13 +1104,22 @@ export default class SyncManager {
       }),
     );
 
+    const plannedUploadPaths =
+      plan.uploadedPaths ??
+      new Set(
+        plan.actions
+          .filter((action) => action.type === "upload")
+          .map((action) => action.filePath),
+      );
     await this.commitSync(
       plan.treeFiles,
       plan.baseTreeSha,
       plan.conflictResolutions,
       plan.expectedHeadSha,
       plan.remoteDeletedFolders,
+      plan.remoteFolders,
       plan.confirmedDeletedFolders,
+      plannedUploadPaths,
     );
   }
 
@@ -1139,21 +1602,34 @@ export default class SyncManager {
     let confirmedDeletedFolders = await this.applyExplicitFolderDeletes(
       remoteSnapshot.explicitFolderDeletes,
     );
+    const remoteFolderReconcile = await this.reconcileRemoteFolders(
+      remoteSnapshot.metadata.folders ?? {},
+    );
+    const localFolderStateChanged = this.hasFolderStateDiff(
+      this.buildDerivedFolders(
+        this.metadataStore.data.files,
+        this.metadataStore.data.folders,
+        this.metadataStore.data.deletedFolders,
+      ),
+      remoteSnapshot.metadata.folders ?? {},
+    );
 
     if (actions.length === 0) {
       if (
         remoteSnapshot.metadataChanged ||
         localSnapshot.metadataChanged ||
-        hasLocalDeletedFolders ||
-        confirmedDeletedFolders.size > 0
+        localFolderStateChanged ||
+        hasLocalDeletedFolders
       ) {
         await this.logger.info(
           "No file actions to sync, committing metadata updates only",
           {
             remoteMetadataChanged: remoteSnapshot.metadataChanged,
             localMetadataChanged: localSnapshot.metadataChanged,
+            localFolderStateChanged,
             hasLocalDeletedFolders,
-            confirmedDeletedFolders: Array.from(confirmedDeletedFolders),
+            createdLocalFolders: remoteFolderReconcile.createdLocalFolders,
+            remoteFolderMetadataChanged: remoteFolderReconcile.metadataChanged,
           },
         );
         await this.commitRemotePlan({
@@ -1165,6 +1641,7 @@ export default class SyncManager {
           remoteDeletedFolders: remoteSnapshot.explicitFolderDeletes.map(
             (folder) => folder.path,
           ),
+          remoteFolders: remoteSnapshot.metadata.folders,
           treeFiles: this.buildInitialCommitTree(remoteSnapshot.treeFiles),
         });
         return;
@@ -1197,6 +1674,7 @@ export default class SyncManager {
       remoteDeletedFolders: remoteSnapshot.explicitFolderDeletes.map(
         (folder) => folder.path,
       ),
+      remoteFolders: remoteSnapshot.metadata.folders,
       treeFiles: this.buildInitialCommitTree(remoteSnapshot.treeFiles),
     });
   }
@@ -1597,8 +2075,21 @@ export default class SyncManager {
     conflictResolutions: ConflictResolution[] = [],
     expectedHeadSha?: string,
     remoteDeletedFolders: string[] = [],
-    confirmedDeletedFolders: Set<string> = new Set(),
+    remoteFoldersOrConfirmedDeletedFolders:
+      | { [key: string]: FolderMetadata }
+      | Set<string> = {},
+    confirmedDeletedFoldersArg: Set<string> = new Set(),
+    uploadedPaths: Set<string> = new Set(),
   ) {
+    const remoteFolders =
+      remoteFoldersOrConfirmedDeletedFolders instanceof Set
+        ? {}
+        : remoteFoldersOrConfirmedDeletedFolders;
+    const confirmedDeletedFolders =
+      remoteFoldersOrConfirmedDeletedFolders instanceof Set
+        ? remoteFoldersOrConfirmedDeletedFolders
+        : confirmedDeletedFoldersArg;
+
     // Sync timestamp — used for manifest snapshot but NOT applied to live
     // metadataStore until after commit succeeds (deferred writes pattern).
     const syncTime = Date.now();
@@ -1607,11 +2098,25 @@ export default class SyncManager {
     // modifying metadataStore.data directly. Only apply after commit succeeds.
     // This prevents stale metadata if any API call fails mid-pipeline.
     const pendingSHAs: { [filePath: string]: string | null } = {};
+    const manifestPath = `${this.vault.configDir}/${MANIFEST_FILE_NAME}`;
+    const uploadPaths = new Set<string>([
+      ...Array.from(uploadedPaths),
+      ...Object.keys(treeFiles).filter((filePath: string) => {
+        if (filePath === manifestPath) {
+          return false;
+        }
+        return (
+          Object.prototype.hasOwnProperty.call(treeFiles[filePath], "content") &&
+          treeFiles[filePath].sha !== null
+        );
+      }),
+    ]);
 
     await Promise.all(
-      Object.keys(treeFiles)
-        .filter((filePath: string) => treeFiles[filePath].content)
-        .map(async (filePath: string) => {
+      Array.from(uploadPaths).map(async (filePath: string) => {
+          if (!treeFiles[filePath] || treeFiles[filePath].sha === null) {
+            return;
+          }
           if (hasTextExtension(filePath)) {
             const resolution = conflictResolutions.find(
               (item) => item.filePath === filePath,
@@ -1643,9 +2148,25 @@ export default class SyncManager {
       JSON.stringify(this.metadataStore.data),
     );
     manifestSnapshot.lastSync = syncTime;
-    for (const [fp, sha] of Object.entries(pendingSHAs)) {
-      if (manifestSnapshot.files[fp]) {
-        manifestSnapshot.files[fp].sha = sha;
+    for (const fp of uploadPaths) {
+      const sha =
+        pendingSHAs[fp] ??
+        treeFiles[fp]?.sha ??
+        manifestSnapshot.files[fp]?.sha ??
+        null;
+      manifestSnapshot.files[fp] ??= {
+        path: fp,
+        sha,
+        dirty: false,
+        justDownloaded: false,
+        lastModified: syncTime,
+      };
+      manifestSnapshot.files[fp].sha = sha;
+      manifestSnapshot.files[fp].dirty = false;
+      manifestSnapshot.files[fp].justDownloaded = false;
+      if (manifestSnapshot.files[fp].deleted) {
+        manifestSnapshot.files[fp].deleted = false;
+        delete manifestSnapshot.files[fp].deletedAt;
       }
     }
     conflictResolutions.forEach((resolution) => {
@@ -1653,24 +2174,38 @@ export default class SyncManager {
         manifestSnapshot.files[resolution.filePath].lastModified = syncTime;
       }
     });
+    manifestSnapshot.folders = this.buildDerivedFolders(
+      manifestSnapshot.files,
+      {
+        ...(remoteFolders ?? {}),
+        ...(manifestSnapshot.folders ?? {}),
+      },
+      remoteDeletedFolders,
+    );
     const liveTreeFiles = Object.fromEntries(
       Object.entries(treeFiles).filter(([, item]) => item.sha !== null || item.content),
     );
-    const remainingExplicitFolderDeletes = this.buildManifestDeletedFolders(
+    manifestSnapshot.deletedFolders = this.buildLegacyDeletedFolders(
+      manifestSnapshot.folders,
       manifestSnapshot.files,
       liveTreeFiles,
-      remoteDeletedFolders,
-      confirmedDeletedFolders,
     );
-    manifestSnapshot.deletedFolders =
-      remainingExplicitFolderDeletes.length > 0
-        ? remainingExplicitFolderDeletes
-        : undefined;
+    if (manifestSnapshot.deletedFolders.length === 0) {
+      delete manifestSnapshot.deletedFolders;
+    }
+
+    // Ensure the manifest entry exists even when the remote tree doesn't already
+    // contain it, such as during metadata-only syncs against a freshly seeded branch.
+    treeFiles[manifestPath] ??= {
+      path: manifestPath,
+      mode: "100644",
+      type: "blob",
+      content: "",
+    };
 
     // Update manifest in list of new tree items
-    delete treeFiles[`${this.vault.configDir}/${MANIFEST_FILE_NAME}`].sha;
-    treeFiles[`${this.vault.configDir}/${MANIFEST_FILE_NAME}`].content =
-      JSON.stringify(manifestSnapshot);
+    delete treeFiles[manifestPath].sha;
+    treeFiles[manifestPath].content = JSON.stringify(manifestSnapshot);
 
     // Create the new tree
     const newTree: { tree: NewTreeRequestItem[]; base_tree: string } = {
@@ -1708,9 +2243,25 @@ export default class SyncManager {
     this.metadataStore.data.lastSync = syncTime;
 
     // Apply pending SHAs
-    for (const [fp, sha] of Object.entries(pendingSHAs)) {
-      if (this.metadataStore.data.files[fp]) {
-        this.metadataStore.data.files[fp].sha = sha;
+    for (const fp of uploadPaths) {
+      const sha =
+        pendingSHAs[fp] ??
+        treeFiles[fp]?.sha ??
+        this.metadataStore.data.files[fp]?.sha ??
+        null;
+      this.metadataStore.data.files[fp] ??= {
+        path: fp,
+        sha,
+        dirty: false,
+        justDownloaded: false,
+        lastModified: syncTime,
+      };
+      this.metadataStore.data.files[fp].sha = sha;
+      this.metadataStore.data.files[fp].dirty = false;
+      this.metadataStore.data.files[fp].justDownloaded = false;
+      if (this.metadataStore.data.files[fp].deleted) {
+        this.metadataStore.data.files[fp].deleted = false;
+        delete this.metadataStore.data.files[fp].deletedAt;
       }
     }
 
@@ -1726,6 +2277,7 @@ export default class SyncManager {
     );
 
     delete this.metadataStore.data.deletedFolders;
+    this.metadataStore.data.folders = manifestSnapshot.folders;
 
     // Purge stale tombstones: deleted entries whose parent folder no longer
     // exists locally. These have served their purpose — the deletion has been
@@ -1871,6 +2423,15 @@ export default class SyncManager {
     await this.logger.info("Loading metadata");
     await this.metadataStore.load();
     let cleaned = false;
+    const initialFolders = JSON.stringify(this.metadataStore.data.folders ?? {});
+    this.metadataStore.data.folders = this.buildDerivedFolders(
+      this.metadataStore.data.files,
+      this.metadataStore.data.folders,
+      this.metadataStore.data.deletedFolders,
+    );
+    if (JSON.stringify(this.metadataStore.data.folders) !== initialFolders) {
+      cleaned = true;
+    }
 
     const sanitizedDeletedFolders = this.sanitizeDeletedFolders(
       this.metadataStore.data.deletedFolders,
@@ -1882,6 +2443,18 @@ export default class SyncManager {
       this.metadataStore.data.deletedFolders = sanitizedDeletedFolders;
       cleaned = true;
     }
+
+    Object.keys(this.metadataStore.data.folders).forEach((folderPath) => {
+      if (
+        !isTrackableSyncFolderPath(folderPath, {
+          configDir: this.vault.configDir,
+          syncConfigDir: this.settings.syncConfigDir,
+        })
+      ) {
+        delete this.metadataStore.data.folders?.[folderPath];
+        cleaned = true;
+      }
+    });
 
     Object.keys(this.metadataStore.data.files).forEach((filePath) => {
       if (!this.isTrackablePath(filePath, true)) {
@@ -1933,6 +2506,35 @@ export default class SyncManager {
           lastModified: Date.now(),
         };
       });
+      folders = [this.vault.getRoot().path];
+      while (folders.length > 0) {
+        const folder = folders.pop();
+        if (folder === undefined) {
+          continue;
+        }
+        if (!this.settings.syncConfigDir && folder === this.vault.configDir) {
+          continue;
+        }
+        const res = await this.vault.adapter.list(folder);
+        for (const childFolder of res.folders) {
+          folders.push(childFolder);
+          if (
+            !isTrackableSyncFolderPath(childFolder, {
+              configDir: this.vault.configDir,
+              syncConfigDir: this.settings.syncConfigDir,
+            })
+          ) {
+            continue;
+          }
+          this.metadataStore.data.folders ??= {};
+          this.metadataStore.data.folders[childFolder] = {
+            path: childFolder,
+            deleted: false,
+            deletedAt: null,
+            lastModified: Date.now(),
+          };
+        }
+      }
 
       // Must be the first time we run, initialize the metadata store
       // with itself and all files in the vault.
@@ -1945,6 +2547,21 @@ export default class SyncManager {
         justDownloaded: false,
         lastModified: Date.now(),
       };
+      await this.metadataStore.save();
+    }
+    const normalizedFolders = this.buildDerivedFolders(
+      this.metadataStore.data.files,
+      this.metadataStore.data.folders,
+      this.metadataStore.data.deletedFolders,
+    );
+    if (
+      JSON.stringify(normalizedFolders) !==
+      JSON.stringify(this.metadataStore.data.folders ?? {})
+    ) {
+      this.metadataStore.data.folders = normalizedFolders;
+      cleaned = true;
+    }
+    if (cleaned) {
       await this.metadataStore.save();
     }
     await this.logger.info("Loaded metadata");
