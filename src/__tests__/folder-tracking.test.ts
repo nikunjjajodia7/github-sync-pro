@@ -852,4 +852,184 @@ describe("folder tracking", () => {
     expect(client.createTree).not.toHaveBeenCalled();
     expect(client.createCommit).not.toHaveBeenCalled();
   });
+
+  it("commits a smoke-style namespace empty folder without creating a remote blob", async () => {
+    vault = createMockVault({
+      ".obsidian/github-sync-metadata.json": JSON.stringify({
+        lastSync: 0,
+        files: {},
+        folders: {},
+      }),
+    });
+    vault._dirs.add("Other Research");
+    vault._dirs.add("Other Research/__sync-smoke__");
+    vault._dirs.add("Other Research/__sync-smoke__/run-1");
+    vault._dirs.add("Other Research/__sync-smoke__/run-1/empty-folder");
+
+    const syncManager = new SyncManager(
+      vault as any,
+      settings,
+      async () => [],
+      createMockLogger() as any,
+    );
+    const metadataStore = createMockMetadataStore(
+      {},
+      {
+        "Other Research": {
+          path: "Other Research",
+          deleted: false,
+          deletedAt: null,
+          lastModified: 1,
+        },
+        "Other Research/__sync-smoke__": {
+          path: "Other Research/__sync-smoke__",
+          deleted: false,
+          deletedAt: null,
+          lastModified: 1,
+        },
+        "Other Research/__sync-smoke__/run-1": {
+          path: "Other Research/__sync-smoke__/run-1",
+          deleted: false,
+          deletedAt: null,
+          lastModified: 1,
+        },
+        "Other Research/__sync-smoke__/run-1/empty-folder": {
+          path: "Other Research/__sync-smoke__/run-1/empty-folder",
+          deleted: false,
+          deletedAt: null,
+          lastModified: 1,
+        },
+      },
+    );
+    (syncManager as any).metadataStore = metadataStore;
+
+    const client = createMockGithubClient();
+    client.getBranchHeadSha.mockResolvedValue("head-sha");
+    client.getRepoContent.mockResolvedValue({
+      files: {
+        ".obsidian/github-sync-metadata.json": makeTreeFile(
+          ".obsidian/github-sync-metadata.json",
+          "manifest-sha",
+        ),
+      },
+      sha: "tree-sha",
+    });
+    client.getBlob.mockResolvedValue({
+      content: Buffer.from(
+        JSON.stringify({
+          lastSync: 0,
+          files: {},
+          folders: {},
+        }),
+      ).toString("base64"),
+    });
+    client.createTree.mockResolvedValue("new-tree-sha");
+    client.createCommit.mockResolvedValue("commit-sha");
+    client.updateBranchHead.mockResolvedValue(undefined);
+    (syncManager as any).client = client;
+
+    await (syncManager as any).syncImpl();
+
+    const treeItems = client.createTree.mock.calls[0][0].tree.tree;
+    expect(
+      treeItems.some(
+        (item: any) =>
+          item.path === "Other Research/__sync-smoke__/run-1/empty-folder",
+      ),
+    ).toBe(false);
+
+    const manifestEntry = treeItems.find(
+      (item: any) => item.path === ".obsidian/github-sync-metadata.json",
+    );
+    const manifest = JSON.parse(manifestEntry.content);
+    expect(
+      manifest.folders["Other Research/__sync-smoke__/run-1/empty-folder"],
+    ).toMatchObject({
+      path: "Other Research/__sync-smoke__/run-1/empty-folder",
+      deleted: false,
+    });
+  });
+
+  it("recovers a smoke-style namespace folder and note when metadata is missing inside a non-empty manifest", async () => {
+    vault = createMockVault({
+      ".obsidian/github-sync-metadata.json": JSON.stringify({
+        lastSync: 0,
+        files: {
+          "Projects/keep.md": {
+            path: "Projects/keep.md",
+            sha: "keep-sha",
+            dirty: false,
+            justDownloaded: false,
+            lastModified: 1,
+          },
+        },
+        folders: {
+          Projects: {
+            path: "Projects",
+            deleted: false,
+            deletedAt: null,
+            lastModified: 1,
+          },
+        },
+      }),
+      "Projects/keep.md": "# keep",
+      "Other Research/__sync-smoke__/run-1/fresh-note.md": "# smoke",
+    });
+
+    const syncManager = new SyncManager(
+      vault as any,
+      settings,
+      async () => [],
+      createMockLogger() as any,
+    );
+    const metadataStore = createMockMetadataStore(
+      {
+        "Projects/keep.md": {
+          path: "Projects/keep.md",
+          sha: "keep-sha",
+          dirty: false,
+          justDownloaded: false,
+          lastModified: 1,
+        },
+      },
+      {
+        Projects: {
+          path: "Projects",
+          deleted: false,
+          deletedAt: null,
+          lastModified: 1,
+        },
+      },
+    );
+    (syncManager as any).metadataStore = metadataStore;
+
+    const remoteSnapshot = {
+      explicitFolderDeletes: [],
+      metadata: {
+        lastSync: 0,
+        files: {},
+        folders: {},
+      },
+      metadataChanged: false,
+      treeFiles: {},
+      treeSha: "tree-sha",
+    };
+
+    const snapshot = await (syncManager as any).buildLocalSnapshot(remoteSnapshot);
+
+    expect(snapshot.metadataChanged).toBe(true);
+    expect(
+      metadataStore.data.files["Other Research/__sync-smoke__/run-1/fresh-note.md"],
+    ).toMatchObject({
+      path: "Other Research/__sync-smoke__/run-1/fresh-note.md",
+      sha: null,
+      dirty: true,
+    });
+    expect(
+      metadataStore.data.folders?.["Other Research/__sync-smoke__/run-1"],
+    ).toMatchObject({
+      path: "Other Research/__sync-smoke__/run-1",
+      deleted: false,
+    });
+  });
 });
