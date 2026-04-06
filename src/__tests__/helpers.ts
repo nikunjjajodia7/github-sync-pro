@@ -1,5 +1,5 @@
 import { vi } from "vitest";
-import { FileMetadata, Metadata } from "../metadata-store";
+import { FileMetadata, FolderMetadata, Metadata } from "../metadata-store";
 
 /**
  * Creates a mock Vault adapter with in-memory file system.
@@ -48,6 +48,35 @@ export function createMockVault(files: Record<string, string | ArrayBuffer> = {}
       }
       const prefix = path === "" || path === "/" ? "" : path + "/";
       return Object.keys(store).some((key) => key.startsWith(prefix));
+    }),
+    stat: vi.fn(async (path: string) => {
+      if (path in store) {
+        const content = store[path];
+        return {
+          type: "file",
+          size: typeof content === "string" ? content.length : content.byteLength,
+          ctime: Date.now(),
+          mtime: Date.now(),
+        };
+      }
+      if (dirs.has(path)) {
+        return {
+          type: "folder",
+          size: 0,
+          ctime: Date.now(),
+          mtime: Date.now(),
+        };
+      }
+      const prefix = path === "" || path === "/" ? "" : path + "/";
+      if (Object.keys(store).some((key) => key.startsWith(prefix))) {
+        return {
+          type: "folder",
+          size: 0,
+          ctime: Date.now(),
+          mtime: Date.now(),
+        };
+      }
+      return null;
     }),
     mkdir: vi.fn(async (dirPath: string) => {
       dirs.add(dirPath);
@@ -105,6 +134,28 @@ export function createMockVault(files: Record<string, string | ArrayBuffer> = {}
   return {
     configDir: ".obsidian",
     getRoot: () => ({ path: "" }),
+    getAbstractFileByPath: (path: string) => {
+      if (path in store) {
+        return { path };
+      }
+      if (dirs.has(path)) {
+        return { path, children: [], isRoot: () => path === "" };
+      }
+      const prefix = path === "" || path === "/" ? "" : path + "/";
+      if (Object.keys(store).some((key) => key.startsWith(prefix))) {
+        return { path, children: [], isRoot: () => path === "" };
+      }
+      return null;
+    },
+    getAllLoadedFiles: () => [
+      { path: "", children: [], isRoot: () => true },
+      ...Array.from(dirs).map((path) => ({
+        path,
+        children: [],
+        isRoot: () => path === "",
+      })),
+      ...Object.keys(store).map((path) => ({ path })),
+    ],
     adapter,
     on: vi.fn(),
     // Expose store for test assertions
@@ -116,10 +167,14 @@ export function createMockVault(files: Record<string, string | ArrayBuffer> = {}
 /**
  * Creates a mock MetadataStore.
  */
-export function createMockMetadataStore(initialFiles: Record<string, FileMetadata> = {}) {
+export function createMockMetadataStore(
+  initialFiles: Record<string, FileMetadata> = {},
+  initialFolders: Record<string, FolderMetadata> = {},
+) {
   const data: Metadata = {
     lastSync: 0,
     files: { ...initialFiles },
+    folders: { ...initialFolders },
   };
 
   return {
@@ -129,6 +184,7 @@ export function createMockMetadataStore(initialFiles: Record<string, FileMetadat
     reset: vi.fn(() => {
       data.lastSync = 0;
       data.files = {};
+      data.folders = {};
     }),
   };
 }

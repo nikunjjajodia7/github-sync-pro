@@ -1,6 +1,10 @@
 #!/bin/bash
-# Integration tests for the 8 RISKS identified in the architecture review
-# Tests actual sync behavior against the real vault and GitHub
+# LEGACY: kept for reference only.
+# The primary release gate now lives in scripts/live-matrix-isolated.sh and
+# scripts/live-smoke-real-vault.sh, which separate deterministic isolated
+# semantics from namespace-scoped real-vault smoke checks.
+# This older script targets the real vault directly and is too noisy to use as
+# the primary decision gate.
 
 set -e
 

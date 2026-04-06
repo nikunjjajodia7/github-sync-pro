@@ -37,6 +37,13 @@ export interface ExplicitFolderDelete {
   deletedAt?: number | null;
 }
 
+export interface FolderMetadata {
+  path: string;
+  deleted?: boolean | null;
+  deletedAt?: number | null;
+  lastModified: number;
+}
+
 export interface Metadata {
   lastSync: number;
   files: { [key: string]: FileMetadata };
@@ -44,6 +51,7 @@ export interface Metadata {
   // When syncing, these are removed on the other device.
   // Entries are purged after they've been synced to remote.
   deletedFolders?: string[];
+  folders?: { [key: string]: FolderMetadata };
 }
 
 /**
@@ -70,8 +78,9 @@ export default class MetadataStore {
       const content = await this.vault.adapter.read(this.metadataFile);
       this.data = JSON.parse(content);
     } else {
-      this.data = { lastSync: 0, files: {} };
+      this.data = { lastSync: 0, files: {}, folders: {} };
     }
+    this.data.folders ??= {};
   }
 
   /**
@@ -88,6 +97,6 @@ export default class MetadataStore {
   }
 
   reset() {
-    this.data = { lastSync: 0, files: {} };
+    this.data = { lastSync: 0, files: {}, folders: {} };
   }
 }

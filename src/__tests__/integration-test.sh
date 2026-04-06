@@ -1,7 +1,10 @@
 #!/bin/bash
-# Integration test script for sync engine behavior
-# This tests REAL behavior against the actual vault and GitHub repo
-# All test files go in: Other Research/__sync-integration-test__/
+# LEGACY: kept for reference only.
+# The primary release gate now lives in scripts/live-matrix-isolated.sh and
+# scripts/live-smoke-real-vault.sh, which separate deterministic isolated
+# semantics from namespace-scoped real-vault smoke checks.
+# This older script targets the real vault directly and is too noisy to use as
+# the primary decision gate.
 
 set -e
 

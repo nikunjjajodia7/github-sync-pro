@@ -317,8 +317,12 @@ describe("folder deletion propagation", () => {
     );
 
     expect(metadataStore.data.deletedFolders).toBeUndefined();
+    expect(metadataStore.data.folders?.Projects).toMatchObject({
+      path: "Projects",
+      deleted: true,
+    });
     expect(
       JSON.parse((treeFiles as any)[manifestPath].content).deletedFolders,
-    ).toBeUndefined();
+    ).toEqual(["Projects"]);
   });
 });

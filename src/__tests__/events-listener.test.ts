@@ -46,12 +46,50 @@ describe("EventsListener", () => {
       expect(Object.keys(metadataStore.data.files)).toHaveLength(0);
     });
 
-    it("skips folders (TFolder instances)", async () => {
-      // TFolder is identified by instanceof check; we simulate by passing a folder-like object
-      // In the real code, it checks `file instanceof TFolder` — we can't easily mock this
-      // but we can verify the file IS added for a regular file
-      await callOnCreate({ path: "note.md" });
-      expect(metadataStore.data.files["note.md"]).toBeDefined();
+    it("tracks created folders in folder metadata", async () => {
+      const folder = Object.create(TFolder.prototype) as TFolder & { path: string };
+      folder.path = "Projects";
+
+      await callOnCreate(folder);
+
+      expect(metadataStore.data.folders?.Projects).toMatchObject({
+        path: "Projects",
+        deleted: false,
+      });
+      expect(metadataStore.save).toHaveBeenCalled();
+    });
+
+    it("tracks externally created folders using path resolution", async () => {
+      vault._dirs.add("Projects");
+
+      await callOnCreate({ path: "Projects" });
+
+      expect(metadataStore.data.folders?.Projects).toMatchObject({
+        path: "Projects",
+        deleted: false,
+      });
+      expect(metadataStore.data.files.Projects).toBeUndefined();
+      expect(metadataStore.save).toHaveBeenCalled();
+    });
+
+    it("tracks path-only folder candidates when vault lookup lags", async () => {
+      await callOnCreate({ path: "Projects" });
+
+      expect(metadataStore.data.folders?.Projects).toMatchObject({
+        path: "Projects",
+        deleted: false,
+      });
+      expect(metadataStore.data.files.Projects).toBeUndefined();
+    });
+
+    it("tracks folder-like create events without relying on instanceof", async () => {
+      await callOnCreate({ path: "Projects", children: [] });
+
+      expect(metadataStore.data.folders?.Projects).toMatchObject({
+        path: "Projects",
+        deleted: false,
+      });
+      expect(metadataStore.data.files.Projects).toBeUndefined();
     });
 
     it("clears justDownloaded flag instead of marking dirty", async () => {
@@ -107,6 +145,19 @@ describe("EventsListener", () => {
       expect(metadataStore.data.files["note.md"].deleted).toBe(true);
       expect(metadataStore.data.files["note.md"].deletedAt).toBeGreaterThan(0);
       expect(metadataStore.save).toHaveBeenCalled();
+    });
+
+    it("marks tracked folder as deleted and preserves legacy deletedFolders", async () => {
+      const folder = Object.create(TFolder.prototype) as TFolder & { path: string };
+      folder.path = "Projects";
+
+      await callOnDelete(folder);
+
+      expect(metadataStore.data.folders?.Projects).toMatchObject({
+        path: "Projects",
+        deleted: true,
+      });
+      expect(metadataStore.data.deletedFolders).toEqual(["Projects"]);
     });
 
     it("handles string path (for rename delegation)", async () => {
@@ -215,6 +266,60 @@ describe("EventsListener", () => {
       await callOnRename({ path: "node_modules/b.js" }, "node_modules/a.js");
 
       expect(metadataStore.save).not.toHaveBeenCalled();
+    });
+
+    it("tracks folder rename as old deleted and new live", async () => {
+      metadataStore.data.folders = {
+        Projects: {
+          path: "Projects",
+          deleted: false,
+          lastModified: 1000,
+        },
+        "Projects/Subfolder": {
+          path: "Projects/Subfolder",
+          deleted: false,
+          lastModified: 1000,
+        },
+      };
+      const folder = Object.create(TFolder.prototype) as TFolder & { path: string };
+      folder.path = "Archive";
+
+      await callOnRename(folder, "Projects");
+
+      expect(metadataStore.data.folders?.Projects).toMatchObject({
+        path: "Projects",
+        deleted: true,
+      });
+      expect(metadataStore.data.folders?.Archive).toMatchObject({
+        path: "Archive",
+        deleted: false,
+      });
+      expect(metadataStore.data.folders?.["Archive/Subfolder"]).toMatchObject({
+        path: "Archive/Subfolder",
+        deleted: false,
+      });
+    });
+
+    it("tracks external folder rename using adapter stat fallback", async () => {
+      metadataStore.data.folders = {
+        Projects: {
+          path: "Projects",
+          deleted: false,
+          lastModified: 1000,
+        },
+      };
+      vault._dirs.add("Archive");
+
+      await callOnRename({ path: "Archive" }, "Projects");
+
+      expect(metadataStore.data.folders?.Projects).toMatchObject({
+        path: "Projects",
+        deleted: true,
+      });
+      expect(metadataStore.data.folders?.Archive).toMatchObject({
+        path: "Archive",
+        deleted: false,
+      });
     });
   });
 });
